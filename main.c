@@ -8,7 +8,6 @@ int main(void)
         __disable_irq();
         while (1) {}
     }
-
     __HAL_RCC_GPIOC_CLK_ENABLE();
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
     GPIO_InitTypeDef led = {0};
