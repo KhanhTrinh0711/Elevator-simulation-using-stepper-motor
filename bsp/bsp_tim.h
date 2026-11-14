@@ -4,8 +4,11 @@
 
 #include "stm32f1xx_hal.h"
 
-void BSP_TIM2_Init(void);
-void BSP_TIM2_Start(void);
-void BSP_TIM2_Stop(void);
+extern TIM_HandleTypeDef htim2;
+
+HAL_StatusTypeDef BSP_TIM2_Init(void);
+HAL_StatusTypeDef BSP_TIM2_Start(void);
+HAL_StatusTypeDef BSP_TIM2_Stop(void);
 
 #endif
+

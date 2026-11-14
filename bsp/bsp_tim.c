@@ -3,15 +3,13 @@
 
 TIM_HandleTypeDef htim2;
 
-void BSP_TIM2_Init(void)
+HAL_StatusTypeDef BSP_TIM2_Init(void)
 {
     TIM_ClockConfigTypeDef sClockSourceConfig = {0};
     TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-    /* Enable TIM2 clock */
     __HAL_RCC_TIM2_CLK_ENABLE();
 
-    /* Configure TIM2 */
     htim2.Instance = TIM2;
     htim2.Init.Prescaler = 71;
     htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -19,29 +17,39 @@ void BSP_TIM2_Init(void)
     htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
 
-    HAL_TIM_Base_Init(&htim2);
+    if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
 
-    /* Internal clock source */
     sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-    HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig);
 
-    /* Master configuration */
+    if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
     sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
     sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
 
-    HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig);
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
 
-    /* Configure TIM2 interrupt */
     HAL_NVIC_SetPriority(TIM2_IRQn, 6, 0);
     HAL_NVIC_EnableIRQ(TIM2_IRQn);
+
+    return HAL_OK;
 }
 
-void BSP_TIM2_Start(void)
+HAL_StatusTypeDef BSP_TIM2_Start(void)
 {
-    HAL_TIM_Base_Start_IT(&htim2);
+    return HAL_TIM_Base_Start_IT(&htim2);
 }
 
-void BSP_TIM2_Stop(void)
+HAL_StatusTypeDef BSP_TIM2_Stop(void)
 {
-    HAL_TIM_Base_Stop_IT(&htim2);
+    return HAL_TIM_Base_Stop_IT(&htim2);
 }
+
