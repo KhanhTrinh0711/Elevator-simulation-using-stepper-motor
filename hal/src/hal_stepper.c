@@ -1,8 +1,13 @@
 
+/**
+ * @file hal_stepper.c
+ * @brief Stepper motor driver.
+ */
+#include <stdint.h>
+
 #include "hal_stepper.h"
 #include "bsp_gpio.h"
 
-/* 4 chân điều khiển motor */
 #define STEPPER_GPIO_PORT       GPIOB
 
 #define STEPPER_GPIO_PINS       (GPIO_PIN_10 | \
@@ -10,12 +15,10 @@
                                  GPIO_PIN_12 | \
                                  GPIO_PIN_13)
 
-/* TIM2 ngắt mỗi 1 ms.
-   Cứ 10 lần ngắt thì chuyển pha một lần. */
-#define STEPPER_STEP_INTERVAL   10U
+#define STEPPER_STEP_INTERVAL   (10u)
+#define STEPPER_PHASE_COUNT     (8u)
 
-/* Chuỗi điều khiển half-step */
-static const uint16_t step_sequence[8] =
+static const uint16_t step_sequence[STEPPER_PHASE_COUNT] =
 {
     GPIO_PIN_10,
     GPIO_PIN_10 | GPIO_PIN_11,
@@ -27,16 +30,21 @@ static const uint16_t step_sequence[8] =
     GPIO_PIN_13 | GPIO_PIN_10
 };
 
-/* Biến trạng thái motor */
-static volatile uint8_t step_index = 0;
-static volatile uint8_t step_busy = 0;
+static volatile uint8_t step_index = 0u;
+static volatile uint8_t step_busy = 0u;
 static volatile uint8_t direction = STEPPER_DIR_CW;
+static volatile uint8_t emergency_latched = 0u;
+static volatile uint8_t limit_event_pending = 0u;
 
-static volatile uint32_t remaining_steps = 0;
-static volatile uint16_t timer_count = 0;
+static volatile uint32_t remaining_steps = 0u;
+static volatile uint16_t timer_count = 0u;
 
-/* Ghi trạng thái pha ra GPIO */
-static void Stepper_WritePhase(uint8_t index)
+/**
+ * @brief Apply one half-step phase to the motor outputs.
+ * @param index Phase index.
+ */
+static void
+Stepper_WritePhase (uint8_t index)
 {
     HAL_GPIO_WritePin(STEPPER_GPIO_PORT,
                       STEPPER_GPIO_PINS,
@@ -47,87 +55,190 @@ static void Stepper_WritePhase(uint8_t index)
                       GPIO_PIN_SET);
 }
 
-void Stepper_Init(void)
+/**
+ * @brief Initialize the stepper driver.
+ */
+void
+Stepper_Init (void)
 {
     uint32_t primask = __get_PRIMASK();
+
     __disable_irq();
 
-    step_index = 0;
-    step_busy = 0;
+    step_index = 0u;
+    step_busy = 0u;
     direction = STEPPER_DIR_CW;
-    remaining_steps = 0;
-    timer_count = 0;
-
-    __set_PRIMASK(primask);
+    emergency_latched = 0u;
+    limit_event_pending = 0u;
+    remaining_steps = 0u;
+    timer_count = 0u;
 
     HAL_GPIO_WritePin(STEPPER_GPIO_PORT,
                       STEPPER_GPIO_PINS,
                       GPIO_PIN_RESET);
+
+    __set_PRIMASK(primask);
 }
 
-HAL_StatusTypeDef Stepper_Start(uint32_t steps,
-                                Stepper_Direction_t dir)
+/**
+ * @brief Start the motor without resetting its current phase.
+ */
+HAL_StatusTypeDef
+Stepper_Start (uint32_t steps, Stepper_Direction_t dir)
 {
-    if (steps == 0U)
-    {
-        return HAL_ERROR;
-    }
-
-    if ((dir != STEPPER_DIR_CW) &&
-        (dir != STEPPER_DIR_CCW))
-    {
-        return HAL_ERROR;
-    }
-
     uint32_t primask = __get_PRIMASK();
+    HAL_StatusTypeDef result = HAL_OK;
+
+    if ((0u == steps) ||
+        ((STEPPER_DIR_CW != dir) &&
+         (STEPPER_DIR_CCW != dir)))
+    {
+        return HAL_ERROR;
+    }
+
     __disable_irq();
 
-    /* Không nhận lệnh mới khi motor đang chạy */
-    if (step_busy != 0U)
+    if (0u != emergency_latched)
     {
-        __set_PRIMASK(primask);
+        result = HAL_BUSY;
+    }
+    else if (0u != step_busy)
+    {
+        result = HAL_BUSY;
+    }
+    else
+    {
+        direction = (uint8_t)dir;
+        remaining_steps = steps;
+        timer_count = 0u;
+        step_busy = 1u;
+
+        /* Re-energize the current phase without advancing it. */
+        Stepper_WritePhase(step_index);
+    }
+
+    __set_PRIMASK(primask);
+
+    return result;
+}
+
+/**
+ * @brief Stop the motor and retain the current phase.
+ */
+void
+Stepper_Stop (void)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+
+    step_busy = 0u;
+    remaining_steps = 0u;
+    timer_count = 0u;
+
+    __set_PRIMASK(primask);
+}
+
+/**
+ * @brief Stop the motor and latch the emergency state.
+ */
+void
+Stepper_EmergencyStop (void)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+
+    emergency_latched = 1u;
+    step_busy = 0u;
+    remaining_steps = 0u;
+    timer_count = 0u;
+
+    HAL_GPIO_WritePin(STEPPER_GPIO_PORT,
+                      STEPPER_GPIO_PINS,
+                      GPIO_PIN_RESET);
+
+    __set_PRIMASK(primask);
+}
+
+/**
+ * @brief Recover after the emergency input has been released.
+ */
+HAL_StatusTypeDef
+Stepper_EmergencyRecover (void)
+{
+    uint32_t primask;
+    HAL_StatusTypeDef result = HAL_OK;
+
+    if (GPIO_PIN_SET != HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0))
+    {
         return HAL_BUSY;
     }
 
-    step_index = 0;
-    direction = (uint8_t)dir;
-    remaining_steps = steps;
-    timer_count = 0;
-    step_busy = 1;
-
-    /* Bật pha đầu tiên ngay khi bắt đầu */
-    Stepper_WritePhase(step_index);
-
-    __set_PRIMASK(primask);
-
-    return HAL_OK;
-}
-
-void Stepper_Stop(void)
-{
-    uint32_t primask = __get_PRIMASK();
+    primask = __get_PRIMASK();
     __disable_irq();
 
-    step_busy = 0;
-    remaining_steps = 0;
-    timer_count = 0;
+    if (GPIO_PIN_RESET == HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0))
+    {
+        result = HAL_BUSY;
+    }
+    else
+    {
+        emergency_latched = 0u;
+    }
 
     __set_PRIMASK(primask);
 
-    /*
-     * Giữ nguyên pha hiện tại để giữ mô-men.
-     * Không tắt GPIO ở đây.
-     */
+    return result;
 }
 
-uint8_t Stepper_IsBusy(void)
+/**
+ * @brief Return the emergency latch state.
+ */
+uint8_t
+Stepper_IsEmergencyLatched (void)
+{
+    return emergency_latched;
+}
+
+/**
+ * @brief Return the motor busy state.
+ */
+uint8_t
+Stepper_IsBusy (void)
 {
     return step_busy;
 }
 
-void Stepper_OnTimerElapsed(void)
+/**
+ * @brief Return the pending limit-switch event state.
+ */
+uint8_t
+Stepper_LimitEventPending (void)
 {
-    if (step_busy == 0U)
+    return limit_event_pending;
+}
+
+/**
+ * @brief Clear the pending limit-switch event.
+ */
+void
+Stepper_ClearLimitEvent (void)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    limit_event_pending = 0u;
+    __set_PRIMASK(primask);
+}
+
+/**
+ * @brief Advance the motor by one phase when the interval expires.
+ */
+void
+Stepper_OnTimerElapsed (void)
+{
+    if ((0u != emergency_latched) || (0u == step_busy))
     {
         return;
     }
@@ -139,23 +250,22 @@ void Stepper_OnTimerElapsed(void)
         return;
     }
 
-    timer_count = 0;
+    timer_count = 0u;
 
-    /* Chuyển pha theo chiều quay */
-    if (direction == STEPPER_DIR_CW)
+    if (STEPPER_DIR_CW == direction)
     {
         step_index++;
 
-        if (step_index >= 8U)
+        if (step_index >= STEPPER_PHASE_COUNT)
         {
-            step_index = 0;
+            step_index = 0u;
         }
     }
     else
     {
-        if (step_index == 0U)
+        if (0u == step_index)
         {
-            step_index = 7U;
+            step_index = STEPPER_PHASE_COUNT - 1u;
         }
         else
         {
@@ -167,31 +277,41 @@ void Stepper_OnTimerElapsed(void)
 
     remaining_steps--;
 
-    if (remaining_steps == 0U)
+    if (0u == remaining_steps)
     {
-        step_busy = 0;
+        step_busy = 0u;
     }
 }
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+
+/**
+ * @brief HAL timer callback.
+ */
+void
+HAL_TIM_PeriodElapsedCallback (TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM2)
+    if (TIM2 == htim->Instance)
     {
         Stepper_OnTimerElapsed();
     }
 }
+
+/**
+ * @brief HAL external interrupt callback.
+ */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    if (GPIO_Pin == GPIO_PIN_0)
+    if (GPIO_PIN_0 == GPIO_Pin)
     {
-        /* Emergency: dừng động cơ */
-        Stepper_Stop();
+        Stepper_EmergencyStop();
     }
-    else if (GPIO_Pin == GPIO_PIN_1)
+    else if (GPIO_PIN_1 == GPIO_Pin)
     {
-        /* Limit switch: chỉ dừng nếu motor đang chạy */
-        if (Stepper_IsBusy())
-        {
-            Stepper_Stop();
-        }
+        limit_event_pending = 1u;
+    }
+    else
+    {
+        /* Ignore unused EXTI pins. */
     }
 }
+
+/*** end of file ***/

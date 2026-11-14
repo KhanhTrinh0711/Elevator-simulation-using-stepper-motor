@@ -4,6 +4,7 @@
 #ifndef MAIN_H
 #define MAIN_H
 
+void SystemClock_Config(void);
 /** @brief Run the standalone board LED example. */
 int main (void);
 
