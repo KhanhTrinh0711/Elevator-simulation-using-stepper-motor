@@ -1,14 +1,23 @@
-#include "FreeRTOS.h"
-#include "task.h"
+/** @file freertos_hooks.c
+ * @brief Fail-stop handling for FreeRTOS allocation and stack failures.
+ */
+#include "freertos_hooks.h"
 
-void vApplicationMallocFailedHook(void)
+/** @brief Leave allocation failures visible to the debugger. */
+void
+vApplicationMallocFailedHook (void)
 {
     configASSERT(0);
 }
 
-void vApplicationStackOverflowHook(TaskHandle_t task, char *name)
+/** @brief Leave stack failures visible to the debugger. */
+void
+vApplicationStackOverflowHook (TaskHandle_t p_task, char * p_name)
 {
-    (void)task;
-    (void)name;
+    /* Discard callback parameters; casting to void performs no conversion. */
+    (void)p_task;
+    (void)p_name;
     configASSERT(0);
 }
+
+/*** end of file ***/
