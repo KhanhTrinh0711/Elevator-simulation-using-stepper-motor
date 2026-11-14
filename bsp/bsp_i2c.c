@@ -1,33 +1,45 @@
+/** @file bsp_i2c.c
+ * @brief Serialized I2C1 transport for OLED and encoder.
+ */
 #include "bsp_i2c.h"
+#include <stdbool.h>
 #include "FreeRTOS.h"
 #include "semphr.h"
 #include "task.h"
 
-static I2C_HandleTypeDef hi2c1;
-static SemaphoreHandle_t i2c1_mutex;
-static uint8_t initialized;
+/* Init publishes these before scheduler start; mutex guards transactions. */
+static I2C_HandleTypeDef gh_i2c         = {0};
+static SemaphoreHandle_t gp_bus_mutex   = NULL;
+static bool              gb_initialized = false;
 
-static int context_valid(void)
+static bool i2c_context_valid (void);
+static HAL_StatusTypeDef i2c_lock_bus (uint8_t address,
+    const uint8_t * p_data, uint16_t size, bool * p_locked);
+
+/** @brief Initialize the bus before starting the scheduler. */
+HAL_StatusTypeDef
+BSP_I2C1_Init (void)
 {
-    return __get_IPSR() == 0U && __get_PRIMASK() == 0U &&
-           __get_BASEPRI() == 0U;
-}
+    GPIO_InitTypeDef  pins   = {0};
+    HAL_StatusTypeDef status = HAL_ERROR;
 
-HAL_StatusTypeDef BSP_I2C1_Init(void)
-{
-    GPIO_InitTypeDef pins = {0};
-    HAL_StatusTypeDef status;
-
-    if (!context_valid() ||
-        xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+    if ((!i2c_context_valid()) ||
+        (taskSCHEDULER_NOT_STARTED != xTaskGetSchedulerState()))
+    {
         return HAL_ERROR;
     }
-    if (initialized) {
+
+    if (gb_initialized)
+    {
         return HAL_OK;
     }
-    if (i2c1_mutex == NULL) {
-        i2c1_mutex = xSemaphoreCreateMutex();
-        if (i2c1_mutex == NULL) {
+
+    if (NULL == gp_bus_mutex)
+    {
+        gp_bus_mutex = xSemaphoreCreateMutex();
+
+        if (NULL == gp_bus_mutex)
+        {
             return HAL_ERROR;
         }
     }
@@ -35,80 +47,124 @@ HAL_StatusTypeDef BSP_I2C1_Init(void)
     __HAL_RCC_AFIO_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_AFIO_REMAP_I2C1_DISABLE();
-    pins.Pin = GPIO_PIN_6 | GPIO_PIN_7;
-    pins.Mode = GPIO_MODE_AF_OD;
-    pins.Pull = GPIO_NOPULL;
+    pins.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
+    pins.Mode  = GPIO_MODE_AF_OD;
+    pins.Pull  = GPIO_NOPULL;
     pins.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOB, &pins);
 
     __HAL_RCC_I2C1_CLK_ENABLE();
     __HAL_RCC_I2C1_FORCE_RESET();
     __HAL_RCC_I2C1_RELEASE_RESET();
-    hi2c1.Instance = I2C1;
-    hi2c1.Init.ClockSpeed = 100000U;
-    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-    hi2c1.Init.OwnAddress1 = 0U;
-    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-    hi2c1.Init.OwnAddress2 = 0U;
-    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-    status = HAL_I2C_Init(&hi2c1);
-    initialized = (status == HAL_OK);
+    gh_i2c.Instance             = I2C1;
+    gh_i2c.Init.ClockSpeed      = 100000u;
+    gh_i2c.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+    gh_i2c.Init.OwnAddress1     = 0u;
+    gh_i2c.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+    gh_i2c.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    gh_i2c.Init.OwnAddress2     = 0u;
+    gh_i2c.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    gh_i2c.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+    status                      = HAL_I2C_Init(&gh_i2c);
+    gb_initialized              = (HAL_OK == status);
+
     return status;
 }
 
-static HAL_StatusTypeDef lock_bus(uint8_t address, const uint8_t *data,
-                                 uint16_t size, BaseType_t *locked)
+/** @brief Write one bounded transaction under the bus mutex. */
+HAL_StatusTypeDef
+BSP_I2C1_Write (uint8_t address, const uint8_t * p_data,
+                uint16_t size)
 {
-    *locked = pdFALSE;
-    if (!context_valid() || !initialized || data == NULL || size == 0U ||
-        size > BSP_I2C1_MAX_TRANSFER_SIZE || address < 0x08U || address > 0x77U) {
+    bool              b_locked = false;
+    HAL_StatusTypeDef status   = i2c_lock_bus(address, p_data, size, &b_locked);
+
+    if (HAL_OK != status)
+    {
+        return status;
+    }
+
+    /* HAL never writes TX data; removing const is safe for this call. */
+    /* Widening the validated 7-bit address makes the shift unsigned. */
+    status = HAL_I2C_Master_Transmit(&gh_i2c, ((uint32_t)address << 1u),
+                                   (uint8_t *)p_data, size,
+                                   BSP_I2C1_TIMEOUT_MS);
+
+    if (b_locked)
+    {
+        xSemaphoreGive(gp_bus_mutex);
+    }
+
+    return status;
+}
+
+/** @brief Read registers with one repeated-START transaction. */
+HAL_StatusTypeDef
+BSP_I2C1_ReadRegister (uint8_t address, uint8_t reg,
+                       uint8_t * p_data, uint16_t size)
+{
+    bool              b_locked = false;
+    HAL_StatusTypeDef status   = i2c_lock_bus(address, p_data, size, &b_locked);
+
+    if (HAL_OK != status)
+    {
+        return status;
+    }
+
+    /* Widening the validated 7-bit address makes the shift unsigned. */
+    status = HAL_I2C_Mem_Read(&gh_i2c, ((uint32_t)address << 1u), reg,
+                             I2C_MEMADD_SIZE_8BIT, p_data, size,
+                             BSP_I2C1_TIMEOUT_MS);
+
+    if (b_locked)
+    {
+        xSemaphoreGive(gp_bus_mutex);
+    }
+
+    return status;
+}
+
+/** @brief Check that task APIs and the HAL tick can be used. */
+static bool
+i2c_context_valid (void)
+{
+    return ((0u == __get_IPSR()) && (0u == __get_PRIMASK()) &&
+            (0u == __get_BASEPRI()));
+}
+
+/** @brief Validate arguments and serialize task callers. */
+static HAL_StatusTypeDef
+i2c_lock_bus (uint8_t address, const uint8_t * p_data,
+              uint16_t size, bool * p_locked)
+{
+    *p_locked = false;
+
+    if ((!i2c_context_valid()) || (!gb_initialized) || (NULL == p_data) ||
+        (0u == size) || (size > BSP_I2C1_MAX_TRANSFER_SIZE) ||
+        (address < 0x08u) || (address > 0x77u))
+    {
         return HAL_ERROR;
     }
+
     BaseType_t state = xTaskGetSchedulerState();
-    if (state == taskSCHEDULER_SUSPENDED) {
+
+    if (taskSCHEDULER_SUSPENDED == state)
+    {
         return HAL_ERROR;
     }
-    if (state == taskSCHEDULER_RUNNING) {
-        if (xSemaphoreTake(i2c1_mutex, pdMS_TO_TICKS(BSP_I2C1_TIMEOUT_MS)) != pdTRUE) {
+
+    if (taskSCHEDULER_RUNNING == state)
+    {
+        if (pdTRUE != xSemaphoreTake(
+                gp_bus_mutex, pdMS_TO_TICKS(BSP_I2C1_TIMEOUT_MS)))
+        {
             return HAL_TIMEOUT;
         }
-        *locked = pdTRUE;
+
+        *p_locked = true;
     }
+
     return HAL_OK;
 }
 
-HAL_StatusTypeDef BSP_I2C1_Write(uint8_t address, const uint8_t *data,
-                               uint16_t size)
-{
-    BaseType_t locked;
-    HAL_StatusTypeDef status = lock_bus(address, data, size, &locked);
-    if (status != HAL_OK) {
-        return status;
-    }
-    /* STM32 HAL takes a mutable pointer but does not modify transmit data. */
-    status = HAL_I2C_Master_Transmit(&hi2c1, (uint16_t)address << 1,
-                                    (uint8_t *)data, size, BSP_I2C1_TIMEOUT_MS);
-    if (locked) {
-        xSemaphoreGive(i2c1_mutex);
-    }
-    return status;
-}
-
-HAL_StatusTypeDef BSP_I2C1_ReadRegister(uint8_t address, uint8_t reg,
-                                      uint8_t *data, uint16_t size)
-{
-    BaseType_t locked;
-    HAL_StatusTypeDef status = lock_bus(address, data, size, &locked);
-    if (status != HAL_OK) {
-        return status;
-    }
-    status = HAL_I2C_Mem_Read(&hi2c1, (uint16_t)address << 1, reg,
-                             I2C_MEMADD_SIZE_8BIT, data, size,
-                             BSP_I2C1_TIMEOUT_MS);
-    if (locked) {
-        xSemaphoreGive(i2c1_mutex);
-    }
-    return status;
-}
+/*** end of file ***/
