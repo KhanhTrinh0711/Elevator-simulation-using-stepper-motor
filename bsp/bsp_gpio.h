@@ -1,3 +1,6 @@
+/** @file bsp_gpio.h
+ * @brief Board peripheral API.
+ */
 #ifndef BSP_GPIO_H
 #define BSP_GPIO_H
 
@@ -31,6 +34,9 @@
 #define LED_GREEN_PIN GPIO_PIN_14
 #define LED_RED_PIN   GPIO_PIN_15
 
-void BSP_GPIO_Init(void);
+/** @brief Configure motor outputs, button inputs and status LEDs. */
+void BSP_GPIO_Init (void);
 
-#endif
+#endif /* BSP_GPIO_H */
+
+/*** end of file ***/

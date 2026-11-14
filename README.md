@@ -54,13 +54,12 @@ Trên Debian/Ubuntu: `sudo apt install make gcc-arm-none-eabi binutils-arm-none-
 
 ```sh
 make -j4       # Tạo Bin/firmware.elf, .bin, .hex và Build/firmware.map
-make check-freertos # Kiểm tra liên kết FreeRTOS và xử lý SysTick (cần Python 3, cc)
 make flash     # Ghi firmware qua ST-Link vào 0x08000000, sau đó reset
 make clean     # Xóa Build/ và Bin/
 ```
 
-`make check` hiện tham chiếu `tests/check_firmware.py`, nhưng file này không có trong
-project tại thời điểm sắp xếp lại; chưa khôi phục hoặc thay đổi target này.
+Chưa có target test. Unit test sẽ được bổ sung sau khi thống nhất coding standard
+và unit test rules.
 
 Kết nối ST-Link với SWDIO (PA13), SWCLK (PA14), GND và nguồn/VTref 3.3 V phù hợp board;
 đặt BOOT0 = 0 để khởi động từ Flash. Lệnh flash sẽ thay chương trình đang có trên MCU.
@@ -85,9 +84,6 @@ trực tiếp (không thêm wrapper CMSIS-RTOS). Nguồn và giấy phép đư�
   `vTaskDelay()`/`vTaskDelayUntil()` trong task. Dung lượng heap và stack cần được
   hiệu chỉnh theo task thực tế; stack FreeRTOS tính bằng word 32 bit.
 
-`make check-freertos` tạo ELF riêng trong `Build/` để buộc liên kết scheduler,
-heap, timer, queue, event group và stream buffer, đồng thời chạy test SysTick trên host.
-Đây là kiểm tra build và logic nối tick, chưa xác nhận chuyển ngữ cảnh trên MCU.
 
 ## Viết chương trình HAL
 
@@ -132,3 +128,57 @@ dung lượng Flash thực tế vẫn bị linker giới hạn ở 64 KB.
 
 Kiểm tra build không thay thế kiểm tra trên board: chưa xác nhận LED, xung clock thực tế,
 ST-Link hoặc ngoại vi bằng phần cứng.
+
+## I2C1 dùng chung cho AS5600 và OLED
+
+`bsp/bsp_i2c.h` và `bsp/bsp_i2c.c` dùng cách đặt tên `BSP_*` như module
+GPIO/TIM của nhánh `feature/hal-gpio`. Thư viện ST vẫn nằm trong `hal/`;
+Makefile đã tự nhận source mới trong `bsp/`, HAL I2C đã được bật.
+
+- I2C1: PB6/SCL, PB7/SDA, 100 kHz, alternate-function open-drain.
+  Cần điện trở kéo lên 3,3 V và chung GND; kiểm tra pull-up có sẵn trên module.
+- Gọi `BSP_I2C1_Init()` sau `HAL_Init()` và cấu hình clock, trước scheduler.
+  Kiểm tra giá trị trả về. Hàm tạo một mutex nội bộ dùng chung cho mọi giao dịch.
+- `BSP_I2C1_Write(address, data, size)` ghi gói dữ liệu, phù hợp OLED.
+- `BSP_I2C1_ReadRegister(address, reg, data, size)` đọc thanh ghi địa chỉ 8 bit
+  bằng repeated START, phù hợp AS5600.
+- Địa chỉ đầu vào là 7 bit chưa dịch: AS5600 `0x36`, OLED thường `0x3C`
+  (xác nhận module). Driver tự dịch địa chỉ theo quy ước STM32 HAL.
+- Mỗi gói dài 1..32 byte; OLED nên gửi từng gói gồm control byte và tối đa
+  16 byte dữ liệu, trả mutex giữa các gói để encoder có thể truy cập bus.
+- Chỉ gọi từ task hoặc giai đoạn startup một luồng. Không gọi từ ISR,
+  critical section hoặc khi scheduler suspended; SysTick phải đang chạy.
+- Timeout chờ mutex 25 ms, timeout giao dịch HAL riêng 25 ms. Đây không phải
+  cam kết deadline 25 ms cho toàn hàm: còn phụ thuộc lịch task và timeout nội bộ
+  của HAL. HAL dạng polling chiếm CPU trong lúc truyền; đo lại độ trễ trên kit.
+- Không lấy mutex bên ngoài hoặc gọi trực tiếp HAL I2C1 từ driver thiết bị.
+  Handle và mutex được giữ private để OLED/encoder luôn đi qua cùng lớp bảo vệ.
+- Lỗi đối số/ngữ cảnh/chưa init trả `HAL_ERROR`; hết thời gian chờ mutex trả
+  `HAL_TIMEOUT`; lỗi giao dịch giữ nguyên status từ HAL. Không retry vô hạn.
+  Nếu hết heap, malloc-failed hook hiện tại có thể dừng trước khi Init trả lỗi.
+
+Ví dụ cho bước tích hợp sau (chưa thêm vào `main.c`):
+
+```c
+/* Startup, sau HAL_Init() và trước vTaskStartScheduler(). */
+HAL_StatusTypeDef status = BSP_I2C1_Init();
+/* Xử lý status trước khi cho các task dùng bus. */
+
+/* Trong task, đọc hai byte RAW ANGLE; chỉ dùng raw khi status == HAL_OK. */
+uint8_t raw[2];
+status = BSP_I2C1_ReadRegister(0x36, 0x0C, raw, sizeof(raw));
+
+/* Ví dụ gửi lệnh tắt OLED SSD1306, chưa phải driver khởi tạo màn hình. */
+const uint8_t display_off[] = {0x00, 0xAE};
+status = BSP_I2C1_Write(0x3C, display_off, sizeof(display_off));
+```
+
+Trước PR vào `develop`, kiểm tra trên kit: ACK của cả hai thiết bị, dạng sóng
+SCL/SDA và repeated START; thiết bị không kết nối trả lỗi hữu hạn; OLED và
+encoder chạy đồng thời không xen byte giữa giao dịch; bus vẫn dùng được sau
+một giao dịch lỗi. Khi SDA/SCL bị giữ thấp, API trả lỗi; chưa có cơ chế tự phát
+xung phục hồi bus. Không thay đổi clock/init bus trong lúc các task đang dùng.
+
+Phạm vi nhánh này là BSP I2C và hợp đồng API; chưa thêm OLED driver,
+MotorTask/encoder driver hay nối vào `main.c`. Build hiện tại vẫn chạy blink;
+linker có thể loại I2C chưa được gọi. Kiểm tra compile không thay thế đo trên kit.
