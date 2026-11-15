@@ -32,7 +32,29 @@
 #define APP_MOTOR_RPT_QUEUE_LENGTH   (4u)
 #define APP_POSITION_QUEUE_LENGTH    (1u)
 #define APP_DISPLAY_QUEUE_LENGTH     (1u)
+/* Motor position and reference supervision. */
+#define APP_FLOOR_COUNT                  (3u)
+#define APP_POSITION_MAX_GAP_MS          \
+    (APP_POSITION_PERIOD_MS * 2u)
 
+#define APP_MOTOR_MAGNET_CHECK_PERIOD_MS (50u)
+#define APP_MOTOR_HOME_TIMEOUT_MS        (2000u)
+#define APP_MOTOR_HOME_STABLE_SAMPLES    (10u)
+#define APP_MOTOR_ARRIVAL_TOLERANCE_COUNTS (0u)
+
+/*
+ * Keep MOVE disabled until the mechanical ratio and direction
+ * have been measured on the actual model.
+ *
+ * APP_MOTOR_POSITIVE_DIR_CW:
+ *   1u = positive encoder counts correspond to STEPPER_DIR_CW.
+ *   0u = positive encoder counts correspond to STEPPER_DIR_CCW.
+ *   2u = not measured yet.
+ */
+#define APP_MOTOR_MECHANICS_CALIBRATED   (0u)
+#define APP_MOTOR_STEPS_PER_ENCODER_REV  (0u)
+#define APP_MOTOR_POSITIVE_DIR_CW         (2u)
+#define APP_MOTOR_MOVE_TIMEOUT_MS         (0u)
 #endif /* APP_CFG_H */
 
 /*** end of file ***/
