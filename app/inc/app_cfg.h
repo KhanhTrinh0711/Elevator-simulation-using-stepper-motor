@@ -22,6 +22,8 @@
 /* Sampling intervals in milliseconds; tasks convert using pdMS_TO_TICKS. */
 #define APP_INPUT_PERIOD_MS          (10u)
 #define APP_RFID_PERIOD_MS           (50u)
+/* Elevator owns expiry, measured from AUTH event timestamp. */
+#define APP_AUTH_WINDOW_MS           (3000u)
 #define APP_POSITION_PERIOD_MS       (5u)
 #define APP_DISPLAY_PERIOD_MS        (200u)
 

@@ -1,131 +1,88 @@
-# RC522 driver and standalone RFID test
+# RFID: từ test phần cứng đến đầu vào ứng dụng
 
-Branch: `test/rfid`, created from `origin/develop`.
+Cập nhật 2026-11-15. Giữ tên `task_rfid_test.h/.c` theo yêu cầu; nội dung hiện là logic RFID dùng lại trong InputTask, kèm adapter task độc lập để kiểm tra module.
 
-## Files
+## Hành vi đã chốt
 
-- `hal/inc/hal_rc522.h`: UID/status types and public driver API.
-- `hal/src/hal_rc522.c`: register access, bounded reset, single-card selection.
-- `app/inc/task_rfid_test.h`: task creation and diagnostic snapshot API.
-- `app/src/task_rfid_test.c`: polling, error retry, test LEDs and snapshot.
+- Nhận mọi thẻ đọc được UID hợp lệ 4/7/10 byte. Chưa lọc danh sách UID theo quyết định của leader.
+- Mỗi lần đưa thẻ tạo tối đa một `APP_INPUT_AUTH`, `b_authorized = true`, gửi không chờ vào `APP_QUEUE_INPUT`.
+- Giữ thẻ trước đầu đọc không gửi AUTH lần nữa, kể cả quá 3 giây. Phải có ba lần đọc liên tiếp NO_CARD (chu kỳ tối thiểu 50 ms) để tái nhận thẻ; đổi UID trực tiếp khi chưa xác nhận rút thẻ cũng không mở lại quyền.
+- Lỗi SPI/protocol/collision không được coi là rút thẻ. Module khởi tạo lại sau 1 giây, không busy-wait và không tự phát lại sự kiện cũ.
+- Khi admission đóng, phiên thay đổi trong lúc đọc hoặc queue đầy: bỏ lần quét, tăng dropped_events. Mở khóa/queue có chỗ trống không làm thẻ đang giữ tự phát AUTH.
+- Module không điều khiển LED, không đổi FSM và không tự quản lý quyền chọn tầng. DisplayTask sở hữu OLED/LED trong hệ thống.
 
-Headers declare public contracts; private state and helpers remain in C files.
-Existing HAL/FreeRTOS names and types retain the project's BARR-C exceptions.
+`APP_AUTH_WINDOW_MS = 3000` nằm trong app_cfg.h. ElevatorTask phải kiểm tra Emergency, admission, hai epoch và tuổi sự kiện trước khi nhận AUTH; cấp quyền đến timestamp của sự kiện + 3 giây, không tính lại từ lúc lấy queue. Hết hạn chỉ chặn yêu cầu mới; yêu cầu đã chấp nhận vẫn được phục vụ. Emergency xóa quyền ngay.
 
-## Hardware and supported scope
+Việc cấp quyền và xử lý nút nằm ở ElevatorTask/InputTask chưa triển khai, không được coi chỉ đọc UID thành công là thang đã có luồng điều khiển hoàn chỉnh.
 
-| STM32 | RC522 module |
+## Nối dây
+
+| RC522 | STM32F103C8T6 |
 |---|---|
-| PA5 | SCK |
-| PA6 | MISO |
-| PA7 | MOSI |
-| PB0 | NSS, often labelled SDA/SS on the SPI module |
-| PB1 | RST |
-| 3.3 V / GND | Supply / common ground |
+| SCK | PA5 |
+| MISO | PA6 |
+| MOSI | PA7 |
+| SDA/SS | PB0 (SPI NSS, không phải SDA của I²C) |
+| RST | PB1 |
+| VCC/GND | 3.3 V/GND chung |
 
-The BSP releases RST high and initializes SPI before scheduler start. The test
-waits 50 ms, then performs a software reset from its task. Only MFRC522 version
-0x91/0x92 is accepted. Other versions, including clones, report UNSUPPORTED with
-the observed version in the snapshot; verify the module before relaxing this.
+BSP_SPI1_Init phải thành công trước scheduler. Driver hỗ trợ VersionReg 0x91/0x92, một thẻ; không giải quyết chọn nhiều thẻ, không đọc block/Crypto1. Phiên bản khác trả UNSUPPORTED và lưu version để chẩn đoán. Giữ nguyên driver hal_rc522 trong lần cập nhật này.
 
-The reader supports one ISO14443A card with a 4-, 7- or 10-byte UID. It checks
-anticollision BCC, select-response CRC_A, complete byte lengths and cascade bits.
-It reports collisions instead of resolving a multi-card field. It does not read
-card memory, authenticate Crypto1, support ISO14443B or authorize elevator use.
+## Khởi tạo và quyền sở hữu
 
-Sources: [NXP MFRC522 datasheet, sections 8-10](https://www.nxp.com/docs/en/data-sheet/MFRC522.pdf)
-and [NXP AN10834 card selection](https://www.nxp.com/docs/en/application-note/AN10834.pdf).
-The software CRC_A uses preset 0x6363 and reflected polynomial 0x8408; HLTA frame
-50 00 has CRC bytes 57 CD. RF timer is approximately 25 ms with a 40 ms software
-polling guard. These are not strict transaction deadlines under preemption.
-
-## Expected result
-
-- PB14 green: a complete UID has been read successfully.
-- Both LEDs off: no card answered the wake-up request.
-- PB15 red: SPI, reader, collision or protocol error.
-- Each successful read halts the card; WUPA wakes it on the next poll, so holding
-  a card in place permits repeated reads. successful_reads counts polls, not taps.
-- A fault waits 1000 ms then reinitializes. Normal polls wait APP_RFID_PERIOD_MS
-  (50 ms) after completion. No tight error loop and no HAL_Delay in the task.
-
-The task uses APP_INPUT_PRIORITY and APP_INPUT_STACK_WORDS (3 / 384 words).
-This is a temporary stand-in for InputTask, not a sixth production task.
-Only this task may use the RC522 multi-frame protocol. The SPI mutex serializes
-individual frames, not entire selections. Do not run other LED-writing tasks or
-another RFID consumer during this isolated test. No queue or UART is required.
-
-## Running the isolated test
-
-Production main.c is left unchanged according to the independent-task workflow.
-The default firmware still runs its existing main. For a local kit experiment
-or integration branch, use this startup flow instead of the blink example:
+Trình tự trong chương trình tích hợp (không sửa main.c sản xuất ở nhánh task):
 
 ```c
-#include "main.h"
-#include "stm32f1xx_hal.h"
-#include "bsp_spi.h"
-#include "task_rfid_test.h"
-#include "task.h"
-
-int
-main (void)
-{
-    SystemCoreClockUpdate();
-    configASSERT(HAL_OK == HAL_Init());
-    configASSERT(HAL_OK == BSP_SPI1_Init());
-    configASSERT(pdPASS == task_rfid_test_create());
-
-    vTaskStartScheduler();
-    configASSERT(0);
-
-    for (;;)
-    {
-        /* Scheduler startup failed; stop for inspection. */
-    }
-}
+/* Sau HAL_Init và cấu hình board; trước scheduler. */
+configASSERT(HAL_OK == BSP_SPI1_Init());
+configASSERT(pdPASS == app_ipc_init());
+configASSERT(pdPASS == task_rfid_configure());
 ```
 
-No GPIO motor initialization or motor task is needed. The test configures only
-the two LED pins; SPI configures its own pins. No DisplayTask is needed.
+Chọn duy nhất một cách:
 
-## Reading the UID
+1. **Sản xuất:** InputTask gọi `task_rfid_poll()` ở chu kỳ quét nút 10 ms, trước xử lý nút. Hàm tự giới hạn chu kỳ RFID 50 ms và retry lỗi 1 giây; không tạo task RFID riêng. Tổng số task ứng dụng vẫn là 5.
+2. **Kiểm tra độc lập:** gọi `task_rfid_test_create()` trước scheduler. Adapter dùng stack/priority InputTask; không tạo InputTask hoặc một chủ RC522 thứ hai.
 
-In another task, call `task_rfid_test_snapshot(&snapshot)` using a local
-`task_rfid_snapshot_t snapshot`. Check pdPASS, then status == HAL_RC522_OK before
-using uid.bytes[0..uid.length-1]. Bytes are binary, not a NUL-terminated string.
-The getter copies under a short critical section so readers see a coherent state.
-Only the owning task accesses the RC522 itself.
+Configure chỉ gọi một lần. Caller đầu của poll được ghi nhận là chủ sở hữu; caller khác bị từ chối. Nếu đã tạo adapter thì chỉ adapter được poll. Driver có chờ hữu hạn trong quá trình giao tiếp: chu kỳ 50 ms không phải cam kết deadline cứng; đo ảnh hưởng lên việc quét nút khi ghép InputTask.
 
-For a debugger-only test, break at `rfid_publish` in task_rfid_test.c and inspect
-`*p_snapshot`, especially status, version, uid.length, uid.bytes and
-successful_reads. This avoids calling RTOS APIs from a halted debugger.
-No printf/UART backend is silently assumed or added.
+Admission mặc định **đóng**. Khi scheduler chạy, ElevatorTask (hoặc task điều phối giả lập trong bài test) cập nhật:
 
-## Checks before PR merge
-
-- Compare observed UID with a known card; test card removal and repeated scans.
-- Test reader disconnected, unsupported version, SPI errors and multiple cards.
-- Confirm green/red meaning, no motor output changes and no CPU starvation.
-- Measure task stack high-water mark on the board. Initial stack is not a proof.
-
-Implementation checks use temporary host mocks, not a new tests/ directory:
-SPI emulation covers all UID lengths, no card, collision, invalid BCC/CRC,
-incorrect response length, timeout and failures at every SPI call in a UID read.
-A task mock covers init retry, UID snapshot, LED states, duplicate creation and
-bounded delays. A separate ARM link checks the startup example above.
-These checks do not replace operation on a physical RC522/card.
-
-## Commit only this feature
-
-The assistant has already created test/rfid; do not create it again. For a future
-clean feature the equivalent command is:
-
-```sh
-git fetch origin
-git switch --no-track -c test/rfid origin/develop
+```c
+task_rfid_context_t context = {
+    .authorization_epoch = 1u,
+    .admission_epoch = 1u,
+    .b_enabled = true
+};
+configASSERT(pdPASS == task_rfid_set_context(&context));
 ```
 
-Stage only the five files listed for this feature (including this document),
-commit, push with `git push -u origin test/rfid`, then open a PR with base develop
-and compare test/rfid. Existing CMake/I2C local edits are not part of this change.
+Đây chỉ là ví dụ cho trạng thái cho phép nhận input. Bản tích hợp phải đóng admission trong INIT/HOMING/EMERGENCY/queueLocked; tăng admission_epoch khi đổi phiên đóng/mở và authorization_epoch khi đổi phiên xác thực. Không cấp quyền từ một context cố định như ví dụ trong toàn bộ chương trình.
+
+Elevator vẫn phải kiểm tra cờ Emergency phần cứng trước khi chấp nhận bất kỳ sự kiện nào: notification/context có thể được cập nhật sau ISR dừng motor. InputTask cần dùng cùng snapshot epoch để đóng gói FLOOR; không tự đoán epoch bằng 0. Bộ nhận giả lập phải drain queue khi test; nếu không, queue 6 phần tử sẽ đầy đúng thiết kế.
+
+## Chẩn đoán
+
+Dùng `task_rfid_test_snapshot()` từ task khác để lấy bản sao đồng bộ, hoặc breakpoint trong `rfid_present` để xem sự kiện. Snapshot gồm:
+
+- status, uid, version và timestamp_ticks của lần poll gần nhất;
+- successful_reads: số poll đọc thành công, không phải số lần đưa thẻ;
+- presentations: số lần đưa thẻ đã được tiêu thụ;
+- sent_events: AUTH đã vào queue, chưa có nghĩa Elevator chấp nhận;
+- dropped_events: lần quét bị admission/phiên/queue từ chối.
+
+Không còn tín hiệu xanh/đỏ của demo cũ. UID chỉ có giá trị khi status là OK. Module không tạo thêm UART/printf hoặc queue mới.
+
+## Kiểm tra
+
+Đã dùng mock host tạm ngoài repo để kiểm tra: thẻ bất kỳ được nhận, giữ thẻ, rút/đưa lại, NO_CARD chập chờn, lỗi rồi hồi phục không gia hạn, queue đầy không phát lại, khóa/mở không phát lại, đổi epoch giữa lúc đọc, owner khác bị từ chối, tick rollover và UID dài sai bị báo protocol error.
+
+Build firmware mặc định vẫn là chương trình blink và có thể loại module RFID bằng linker garbage collection; đã kiểm tra thêm liên kết ARM ép giữ các API RFID (thành công). Vẫn cần chạy kit để kiểm chứng tính năng.
+
+Trên kit cần kiểm tra: UID 4/7/10 byte, rút thẻ/giữ thẻ, nhiều thẻ, mất reader, phiên Emergency và queue đầy; đo stack/jitter khi chạy OLED + encoder + RFID. Không tạo tests/ hoặc make check trong lần cập nhật này.
+
+## Phần sẽ bổ sung
+
+Whitelist UID chỉ thêm khi nhóm chốt yêu cầu; hiện bất kỳ thẻ đọc được nào cũng có thể tạo AUTH. Đây là giới hạn truy cập có chủ đích, không phải cơ chế xác thực danh tính.
+
+Header công khai API/kiểu/hằng cần dùng; logic, handle và helper giữ private trong file C. File vẫn mang tên test để giữ đường dẫn được yêu cầu; không cần một driver RC522 thứ hai.

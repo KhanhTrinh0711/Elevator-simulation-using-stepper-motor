@@ -30,7 +30,10 @@ typedef enum
 } app_input_kind_t;
 
 /** @brief Input timestamp uses the RTOS tick clock, not HAL milliseconds.
- * AUTH uses b_authorized; FLOOR uses floor (1..3).
+ * AUTH uses b_authorized; FLOOR uses floor (1..3). RFID currently accepts any
+ * successfully read UID. Elevator alone grants APP_AUTH_WINDOW_MS from the
+ * event timestamp, never from receive time; an expired AUTH must be rejected.
+ * Reject AUTH/FLOOR while hardware emergency is latched or admission closed.
  * ElevatorTask owns epochs and supplies snapshots to InputTask. Reject stale
  * events after emergency, authorization changes or admission lock changes.
  * Unused fields must be zero-initialized by the sender.
