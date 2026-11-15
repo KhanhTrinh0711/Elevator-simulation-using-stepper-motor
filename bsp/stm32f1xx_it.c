@@ -5,24 +5,41 @@
 #include "stm32f1xx_hal.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "bsp_tim.h"
 
-_Static_assert(1000u == configTICK_RATE_HZ,
+_Static_assert(configTICK_RATE_HZ == 1000U,
                "Shared HAL/RTOS SysTick requires 1 ms ticks");
 
 /* The FreeRTOS port supplies this entry point without a public prototype. */
-void xPortSysTickHandler (void);
+void xPortSysTickHandler(void);
 
-/** @brief Service both time bases, including a suspended RTOS scheduler. */
-void
-SysTick_Handler (void)
+/* Shared HAL and FreeRTOS SysTick. */
+void SysTick_Handler(void)
 {
     HAL_IncTick();
 
-    /* FreeRTOS must also count ticks while its scheduler is suspended. */
-    if (taskSCHEDULER_NOT_STARTED != xTaskGetSchedulerState())
+    if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
     {
         xPortSysTickHandler();
     }
+}
+
+/* TIM2 interrupt: stepper motor control. */
+void TIM2_IRQHandler(void)
+{
+    HAL_TIM_IRQHandler(&htim2);
+}
+
+/* Emergency button: PA0. */
+void EXTI0_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);
+}
+
+/* Limit switch: PA1. */
+void EXTI1_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_1);
 }
 
 /*** end of file ***/

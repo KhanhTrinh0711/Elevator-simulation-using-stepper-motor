@@ -15,9 +15,9 @@ BSP_GPIO_Init (void)
 
     /* Configure motor pins: PB10-PB13. */
     pins.Pin = GPIO_PIN_10 |
-                          GPIO_PIN_11 |
-                          GPIO_PIN_12 |
-                          GPIO_PIN_13;
+               GPIO_PIN_11 |
+               GPIO_PIN_12 |
+               GPIO_PIN_13;
 
     pins.Mode  = GPIO_MODE_OUTPUT_PP;
     pins.Pull  = GPIO_NOPULL;
@@ -30,17 +30,30 @@ BSP_GPIO_Init (void)
                       GPIO_PIN_12 | GPIO_PIN_13,
                       GPIO_PIN_RESET);
 
-    /* Configure buttons and limit switch: PA0-PA4. */
-    pins.Pin = GPIO_PIN_0 |
-                          GPIO_PIN_1 |
-                          GPIO_PIN_2 |
-                          GPIO_PIN_3 |
-                          GPIO_PIN_4;
+    /* Emergency button: PA0, active low, EXTI falling edge. */
+    pins.Pin  = GPIO_PIN_0;
+    pins.Mode = GPIO_MODE_IT_FALLING;
+    pins.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOA, &pins);
 
+    /* Limit switch: PA1, active low, EXTI falling edge. */
+    pins.Pin = GPIO_PIN_1;
+    HAL_GPIO_Init(GPIOA, &pins);
+
+    /* Floor buttons: PA2-PA4, polling. */
+    pins.Pin = GPIO_PIN_2 |
+               GPIO_PIN_3 |
+               GPIO_PIN_4;
     pins.Mode = GPIO_MODE_INPUT;
     pins.Pull = GPIO_PULLUP;
-
     HAL_GPIO_Init(GPIOA, &pins);
+
+    /* Enable EXTI interrupts for PA0 and PA1. */
+    HAL_NVIC_SetPriority(EXTI0_IRQn, 6, 0);
+    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+    HAL_NVIC_SetPriority(EXTI1_IRQn, 6, 0);
+    HAL_NVIC_EnableIRQ(EXTI1_IRQn);
 
     /* Configure LEDs: PB14-PB15. */
     pins.Pin   = GPIO_PIN_14 | GPIO_PIN_15;
