@@ -9,9 +9,9 @@
 #define configUSE_PREEMPTION                     1u
 #define configCPU_CLOCK_HZ                       SystemCoreClock
 #define configTICK_RATE_HZ                       1000u
-#define configMAX_PRIORITIES                     5u
+#define configMAX_PRIORITIES                     6u
 #define configMINIMAL_STACK_SIZE                 128u
-#define configTOTAL_HEAP_SIZE                    (8u * 1024u)
+#define configTOTAL_HEAP_SIZE                    (12u * 1024u)
 #define configMAX_TASK_NAME_LEN                  16u
 #define configUSE_16_BIT_TICKS                    0u
 #define configIDLE_SHOULD_YIELD                   1u
@@ -30,6 +30,7 @@
 #define configTIMER_QUEUE_LENGTH                 8u
 #define configTIMER_TASK_STACK_DEPTH              256u
 
+#define INCLUDE_vTaskPrioritySet                 1u
 #define INCLUDE_vTaskDelay                       1u
 #define INCLUDE_vTaskDelayUntil                  1u
 #define INCLUDE_vTaskDelete                      1u
