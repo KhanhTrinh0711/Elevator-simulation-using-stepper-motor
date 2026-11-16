@@ -3,7 +3,7 @@
  */
 #ifndef APP_CFG_H
 #define APP_CFG_H
-
+#define APP_INPUT_UID_CAPACITY (10u)
 /* Priorities exclude the kernel idle and software timer tasks. */
 #define APP_EMERGENCY_PRIORITY       (5u)
 #define APP_ELEVATOR_PRIORITY        (4u)
@@ -22,9 +22,13 @@
 /* Sampling intervals in milliseconds; tasks convert using pdMS_TO_TICKS. */
 #define APP_INPUT_PERIOD_MS          (10u)
 #define APP_RFID_PERIOD_MS           (50u)
+#define APP_RFID_RETRY_MS              (1000u)
 #define APP_POSITION_PERIOD_MS       (5u)
 #define APP_DISPLAY_PERIOD_MS        (200u)
-
+/* Input and RFID timing. */
+#define APP_INPUT_DEBOUNCE_SAMPLES  (3u)
+#define APP_AUTH_WINDOW_MS          (3000u)
+#define APP_RFID_NO_CARD_SAMPLES    (3u)
 /* The active destination is stored separately from the two waiting floors. */
 #define APP_INPUT_QUEUE_LENGTH       (6u)
 #define APP_FLOOR_QUEUE_LENGTH       (2u)

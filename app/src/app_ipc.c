@@ -1,3 +1,4 @@
+
 /** @file app_ipc.c
  * @brief Startup allocation of the application queues and mailboxes.
  */
@@ -37,13 +38,17 @@ static const UBaseType_t g_item_sizes[APP_QUEUE_COUNT] =
 
 /* Written before task creation; RTOS queues synchronize subsequent messages. */
 static QueueHandle_t gp_queues[APP_QUEUE_COUNT] = {NULL};
-static bool          gb_initialized            = false;
+static bool gb_initialized = false;
+
+/* ElevatorTask owns updates; critical sections protect coherent copies. */
+static app_input_context_t g_input_context = {0};
 
 /** @brief Allocate queues or release partial allocations on failure. */
 BaseType_t
-app_ipc_init (void)
+app_ipc_init(void)
 {
-    if ((0u != __get_IPSR()) || (0u != __get_PRIMASK()) ||
+    if ((0u != __get_IPSR()) ||
+        (0u != __get_PRIMASK()) ||
         (0u != __get_BASEPRI()) ||
         (taskSCHEDULER_NOT_STARTED != xTaskGetSchedulerState()))
     {
@@ -55,16 +60,22 @@ app_ipc_init (void)
         return pdPASS;
     }
 
-    for (uint32_t idx = 0u; idx < APP_QUEUE_COUNT; idx++)
+    for (uint32_t queue_index = 0u;
+         queue_index < APP_QUEUE_COUNT;
+         queue_index++)
     {
-        gp_queues[idx] = xQueueCreate(g_queue_lengths[idx], g_item_sizes[idx]);
+        gp_queues[queue_index] = xQueueCreate(
+            g_queue_lengths[queue_index],
+            g_item_sizes[queue_index]);
 
-        if (NULL == gp_queues[idx])
+        if (NULL == gp_queues[queue_index])
         {
-            for (uint32_t cleanup = 0u; cleanup < idx; cleanup++)
+            for (uint32_t cleanup_index = 0u;
+                 cleanup_index < queue_index;
+                 cleanup_index++)
             {
-                vQueueDelete(gp_queues[cleanup]);
-                gp_queues[cleanup] = NULL;
+                vQueueDelete(gp_queues[cleanup_index]);
+                gp_queues[cleanup_index] = NULL;
             }
 
             return pdFAIL;
@@ -78,17 +89,61 @@ app_ipc_init (void)
 
 /** @brief Publish handles only after complete startup initialization. */
 QueueHandle_t
-app_ipc_queue (app_queue_id_t queue_id)
+app_ipc_queue(app_queue_id_t queue_id)
 {
     /* Negative enum values become large unsigned values and are rejected. */
-    uint32_t idx = (uint32_t)queue_id;
+    uint32_t queue_index = (uint32_t)queue_id;
 
-    if ((!gb_initialized) || (idx >= APP_QUEUE_COUNT))
+    if ((!gb_initialized) || (queue_index >= APP_QUEUE_COUNT))
     {
         return NULL;
     }
 
-    return gp_queues[idx];
+    return gp_queues[queue_index];
+}
+
+/** @brief Publish the latest input context atomically. */
+BaseType_t
+app_ipc_input_context_publish(
+    const app_input_context_t *p_context)
+{
+    if ((NULL == p_context) ||
+        (!gb_initialized) ||
+        (0u != __get_IPSR()) ||
+        (0u != __get_PRIMASK()) ||
+        (0u != __get_BASEPRI()) ||
+        (taskSCHEDULER_RUNNING != xTaskGetSchedulerState()))
+    {
+        return pdFAIL;
+    }
+
+    taskENTER_CRITICAL();
+    g_input_context = *p_context;
+    taskEXIT_CRITICAL();
+
+    return pdPASS;
+}
+
+/** @brief Read a coherent copy of the latest input context. */
+BaseType_t
+app_ipc_input_context_read(
+    app_input_context_t *p_context)
+{
+    if ((NULL == p_context) ||
+        (!gb_initialized) ||
+        (0u != __get_IPSR()) ||
+        (0u != __get_PRIMASK()) ||
+        (0u != __get_BASEPRI()) ||
+        (taskSCHEDULER_RUNNING != xTaskGetSchedulerState()))
+    {
+        return pdFAIL;
+    }
+
+    taskENTER_CRITICAL();
+    *p_context = g_input_context;
+    taskEXIT_CRITICAL();
+
+    return pdPASS;
 }
 
 /*** end of file ***/
