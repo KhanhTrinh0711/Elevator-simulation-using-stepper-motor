@@ -50,18 +50,21 @@ Rà soát cục bộ tại ngày cập nhật; không dùng danh sách này đ�
 | app_cfg.h, app_ipc.h/.c | 5 task dự kiến, 6 queue | Hoàn thiện hợp đồng recovery, công tắc và phiên input |
 | Stepper, AS5600, MotorTask | Đã có code | Hiệu chỉnh cơ khí và đổi HOME sang tìm mốc tự động |
 | OLED, task_display | Hiển thị snapshot/FSM/RFID, LED và xử lý dữ liệu cũ | Ghép publisher ElevatorTask, đo trên kit |
-| RC522, task_rfid_test | Driver, lọc lần đưa thẻ, AUTH queue và API poll cho InputTask | Ghép InputTask/ElevatorTask, kiểm chứng kit; whitelist hoãn |
-| EmergencyTask, ElevatorTask, InputTask sản xuất | Chưa thấy module tương ứng | Triển khai theo các bước dưới |
-| main.c | Nháy PC13, chưa chạy scheduler | Chỉ ghép hệ thống ở nhánh integration |
+| RC522, task_rfid_test | Driver, lọc lần đưa thẻ, AUTH queue và API poll cho InputTask | Đã ghép InputTask/ElevatorTask; còn kiểm chứng kit, whitelist hoãn |
+| EmergencyTask, ElevatorTask, InputTask sản xuất | Đã có và ghép trong main | Kiểm chứng kit theo checklist |
+| main.c | Khởi tạo năm task, IPC và scheduler | Nghiệm thu trên kit trước release |
 
 Các giới hạn hiện tại phải xử lý rõ:
 
-- APP_MOTOR_HOME là mã lệnh, không phải một mốc vật lý. Code hiện chỉ xác minh encoder đứng yên khi Emergency đang chốt và từ chối HOME ngoài Emergency. Điều này chưa phù hợp luồng mới.
-- APP_MOTOR_HOME_TIMEOUT_MS = 2000 hiện dành cho xác minh đứng yên, không được mặc định dùng làm timeout toàn hành trình.
-- APP_MOTOR_MECHANICS_CALIBRATED = 0; tỷ lệ bước/encoder, chiều dương và timeout MOVE chưa được đo. Không bật MOVE bằng cách điền số đoán.
-- 0/4096/8192 count là tọa độ danh định, chưa chứng minh đúng khoảng cách ba tầng.
-- Driver RC522 hiện hỗ trợ UID 4/7/10 byte, version 0x91/0x92, một thẻ; demo đọc lặp chưa phải chính sách xác thực sản xuất.
-- README và tài liệu coding standard có mô tả lịch sử cần cập nhật khi tích hợp; không suy ra tình trạng hiện tại chỉ từ các đoạn đó.
+- HOME đã chuyển sang tìm mốc tự động với nhả/tìm/xác nhận có giới hạn.
+- APP_MOTOR_MECHANICS_CALIBRATED = 0; các số cơ khí chưa đo vẫn bằng 0.
+  Firmware mặc định báo ERROR: CONFIG và giữ motor OFF. Không tự điền số đoán.
+- Tọa độ tầng 2/3, timeout và khoảng bước lấy từ cấu hình đo; không còn ép
+  mỗi tầng bằng một vòng encoder. Tốc độ hiện là khoảng bước cố định; chỉ
+  nghiệm thu nếu đã đo đủ thấp để không mất bước, thêm ramp nếu cơ khí cần.
+- InputTask dùng lại RFID policy chung, gửi UID/epoch; nhận mọi UID hợp lệ.
+- Có code không đồng nghĩa hoàn tất checklist trên kit; không đánh dấu P1–P14
+  hoàn tất chỉ vì build/mock thành công. Xem docs/INTEGRATION.md.
 
 ## 4. Cấu trúc mã và phần cứng
 
@@ -178,7 +181,7 @@ Mốc là vị trí cabin tại công tắc tầng 1, không phải một biến
 - Không nhả được, không thấy tác động, encoder lỗi hoặc không tiến triển: dừng, vô hiệu mốc, vào EMERGENCY với nguyên nhân lỗi và giữ khóa tới khi xử lý.
 - Chưa biết tọa độ tuyệt đối vẫn có thể tìm mốc bằng chuyển động tương đối có giám sát. Mất khả năng đọc encoder/giám sát chuyển động thì không được chạy tìm mốc tự động.
 
-APP_MOTOR_HOME sẽ được cập nhật thành lệnh chạy quy trình này khi đã kết thúc Emergency hoặc khi khởi động hợp lệ. Nó không phải lệnh MOVE về count 0 khi count chưa có mốc. Xác nhận zero là bước cuối của HOME, không phải toàn bộ thao tác HOME.
+APP_MOTOR_HOME đã được cập nhật thành lệnh chạy quy trình này khi đã kết thúc Emergency hoặc khi khởi động hợp lệ. Nó không phải lệnh MOVE về count 0 khi count chưa có mốc. Xác nhận zero là bước cuối của HOME, không phải toàn bộ thao tác HOME.
 
 ### 7.3. Cơ khí và encoder
 
@@ -203,7 +206,7 @@ APP_MOTOR_HOME sẽ được cập nhật thành lệnh chạy quy trình này k
 | I²C | 100 kHz ban đầu |
 | Tốc độ, gia tốc, timeout MOVE/HOME, khoảng nhả | Phải đo trước chạy tích hợp |
 
-DisplayTask sản xuất hiển thị tầng (hoặc chưa xác định), trạng thái, chiều, số yêu cầu chờ và thời gian quyền RFID còn lại. Snapshot cần bổ sung nguyên nhân lỗi nếu muốn hiển thị lỗi; cập nhật hợp đồng cùng bên phát/nhận.
+DisplayTask sản xuất hiển thị tầng (hoặc chưa xác định), trạng thái, chiều, số yêu cầu chờ và thời gian quyền RFID còn lại. Snapshot đã có nguyên nhân lỗi CONFIG/SENSOR/MOTOR/IPC, đồng bộ cả bên phát và hiển thị.
 
 LED xanh chỉ bật khi IDLE, motor dừng, không đích, FIFO rỗng và không khóa/Emergency; không đại diện RFID hợp lệ. LED đỏ nháy trong Emergency, tắt khi vận hành bình thường. DisplayTask sở hữu LED lúc chạy hệ thống; task test RFID/GPIO không được cùng ghi LED.
 
@@ -303,3 +306,8 @@ Không tạo lại tests/ hoặc make check trong kế hoạch này. Tiếp tụ
 - 2026-11-15: Leader chốt tạm thời nhận mọi thẻ đọc được UID hợp lệ, mở cửa sổ nút tầng 3 giây; chưa áp dụng whitelist. Giữ thẻ không tự gia hạn.
 
 - 2026-11-16: DisplayTask chuyển từ demo đếm sang mailbox trạng thái; thêm timestamp_ticks vào app_display_snapshot_t. Publisher phát mỗi 200 ms; snapshot quá 1000 ms hiển thị NO DATA, không báo sẵn sàng. Đã có code, chưa đánh dấu nghiệm thu P10 trên kit.
+
+- 2026-11-16: Sửa audit và ghép integration/system-v1: năm task, HOMING có giới
+  hạn, Emergency generation, report FIFO, timestamp sau I²C, RFID owner chung,
+  fatal shutdown và main thực. Chưa đo cơ khí theo xác nhận của leader nên
+  mặc định khóa motor; code chưa được nghiệm thu phần cứng.

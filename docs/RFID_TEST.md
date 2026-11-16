@@ -13,7 +13,8 @@ Cập nhật 2026-11-15. Giữ tên `task_rfid_test.h/.c` theo yêu cầu; nội
 
 `APP_AUTH_WINDOW_MS = 3000` nằm trong app_cfg.h. ElevatorTask phải kiểm tra Emergency, admission, hai epoch và tuổi sự kiện trước khi nhận AUTH; cấp quyền đến timestamp của sự kiện + 3 giây, không tính lại từ lúc lấy queue. Hết hạn chỉ chặn yêu cầu mới; yêu cầu đã chấp nhận vẫn được phục vụ. Emergency xóa quyền ngay.
 
-Việc cấp quyền và xử lý nút nằm ở ElevatorTask/InputTask chưa triển khai, không được coi chỉ đọc UID thành công là thang đã có luồng điều khiển hoàn chỉnh.
+ElevatorTask/InputTask đã được ghép trong main.c ở integration/system-v1.
+Cấu hình chưa hiệu chỉnh vẫn khóa admission và chuyển động; xem INTEGRATION.md.
 
 ## Nối dây
 
@@ -36,7 +37,8 @@ Trình tự trong chương trình tích hợp (không sửa main.c sản xuất 
 /* Sau HAL_Init và cấu hình board; trước scheduler. */
 configASSERT(HAL_OK == BSP_SPI1_Init());
 configASSERT(pdPASS == app_ipc_init());
-configASSERT(pdPASS == task_rfid_configure());
+/* Sản xuất: task_input_create() tự gọi task_rfid_configure().
+ * Chỉ cấu hình trực tiếp khi dùng adapter test thay cho InputTask. */
 ```
 
 Chọn duy nhất một cách:
@@ -77,7 +79,8 @@ Không còn tín hiệu xanh/đỏ của demo cũ. UID chỉ có giá trị khi 
 
 Đã dùng mock host tạm ngoài repo để kiểm tra: thẻ bất kỳ được nhận, giữ thẻ, rút/đưa lại, NO_CARD chập chờn, lỗi rồi hồi phục không gia hạn, queue đầy không phát lại, khóa/mở không phát lại, đổi epoch giữa lúc đọc, owner khác bị từ chối, tick rollover và UID dài sai bị báo protocol error.
 
-Build firmware mặc định vẫn là chương trình blink và có thể loại module RFID bằng linker garbage collection; đã kiểm tra thêm liên kết ARM ép giữ các API RFID (thành công). Vẫn cần chạy kit để kiểm chứng tính năng.
+Firmware hiện khởi tạo InputTask và RFID chung, không còn blink-only.
+Driver và policy đã qua kiểm tra host; vẫn cần kiểm chứng kit.
 
 Trên kit cần kiểm tra: UID 4/7/10 byte, rút thẻ/giữ thẻ, nhiều thẻ, mất reader, phiên Emergency và queue đầy; đo stack/jitter khi chạy OLED + encoder + RFID. Không tạo tests/ hoặc make check trong lần cập nhật này.
 
@@ -86,3 +89,10 @@ Trên kit cần kiểm tra: UID 4/7/10 byte, rút thẻ/giữ thẻ, nhiều th�
 Whitelist UID chỉ thêm khi nhóm chốt yêu cầu; hiện bất kỳ thẻ đọc được nào cũng có thể tạo AUTH. Đây là giới hạn truy cập có chủ đích, không phải cơ chế xác thực danh tính.
 
 Header công khai API/kiểu/hằng cần dùng; logic, handle và helper giữ private trong file C. File vẫn mang tên test để giữ đường dẫn được yêu cầu; không cần một driver RC522 thứ hai.
+
+## Cập nhật tích hợp 2026-11-16
+
+InputTask dùng trực tiếp task_rfid_poll, không còn bản sao state machine RFID.
+Context chuẩn là app_input_context_t trong app_ipc; task_rfid_set_context chỉ
+là adapter tới cùng context cho harness cũ. AUTH luôn điền uid/uid_length.
+Timeout sau khi thẻ đã trả lời WUPA trả TIMEOUT, không tăng bộ đếm rút thẻ.

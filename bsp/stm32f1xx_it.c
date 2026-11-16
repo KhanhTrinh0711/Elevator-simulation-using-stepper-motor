@@ -6,6 +6,8 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "bsp_tim.h"
+#include "task_emergency.h"
+#include "bsp_fault.h"
 
 _Static_assert(configTICK_RATE_HZ == 1000U,
                "Shared HAL/RTOS SysTick requires 1 ms ticks");
@@ -33,13 +35,39 @@ void TIM2_IRQHandler(void)
 /* Emergency button: PA0. */
 void EXTI0_IRQHandler(void)
 {
+    const uint32_t pending = __HAL_GPIO_EXTI_GET_IT(GPIO_PIN_0);
     HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);
+    if (0u != pending)
+    {
+        task_emergency_signal_from_isr();
+    }
 }
 
 /* Limit switch: PA1. */
 void EXTI1_IRQHandler(void)
 {
     HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_1);
+}
+
+
+void HardFault_Handler(void)
+{
+    bsp_fault_stop();
+}
+
+void MemManage_Handler(void)
+{
+    bsp_fault_stop();
+}
+
+void BusFault_Handler(void)
+{
+    bsp_fault_stop();
+}
+
+void UsageFault_Handler(void)
+{
+    bsp_fault_stop();
 }
 
 /*** end of file ***/

@@ -54,7 +54,6 @@ BSP_TIM2_Init (void)
 
     uint32_t timer_clock = 0u;
     uint32_t prescaler = 0u;
-    uint32_t flash_latency = 0u;
 
     /* Enable TIM2 peripheral clock. */
     __HAL_RCC_TIM2_CLK_ENABLE();

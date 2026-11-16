@@ -49,23 +49,60 @@
     (APP_POSITION_PERIOD_MS * 2u)
 
 #define APP_MOTOR_MAGNET_CHECK_PERIOD_MS (50u)
-#define APP_MOTOR_HOME_TIMEOUT_MS        (2000u)
-#define APP_MOTOR_HOME_STABLE_SAMPLES    (10u)
-#define APP_MOTOR_ARRIVAL_TOLERANCE_COUNTS (0u)
+#define APP_EMERGENCY_WAIT_MS         (10000u)
+#define APP_EMERGENCY_RELEASE_MS      (30u)
+#define APP_CONTROL_PERIOD_MS        (10u)
+#define APP_SENSOR_RETRY_MS          (100u)
+#define APP_HOME_SETTLE_MS           (50u)
+#define APP_HOME_VERIFY_TIMEOUT_MS   (1000u)
 
-/*
- * Keep MOVE disabled until the mechanical ratio and direction
- * have been measured on the actual model.
- *
- * APP_MOTOR_POSITIVE_DIR_CW:
- *   1u = positive encoder counts correspond to STEPPER_DIR_CW.
- *   0u = positive encoder counts correspond to STEPPER_DIR_CCW.
- *   2u = not measured yet.
+/* Board measurements: zero means UNCONFIGURED, never guess these values.
+ * Positive encoder counts must mean upward cabin travel. If counts increase
+ * downward, correct the sensor mounting/direction before enabling motion.
+ * Times are ms, positions are encoder counts, intervals are TIM2 1 ms ticks.
  */
-#define APP_MOTOR_MECHANICS_CALIBRATED   (0u)
-#define APP_MOTOR_STEPS_PER_ENCODER_REV  (0u)
-#define APP_MOTOR_POSITIVE_DIR_CW        (2u)
-#define APP_MOTOR_MOVE_TIMEOUT_MS        (0u)
+#ifndef APP_MOTOR_MECHANICS_CALIBRATED
+#define APP_MOTOR_MECHANICS_CALIBRATED  (0u)
+#endif
+#ifndef APP_MOTOR_STEPS_PER_ENCODER_REV
+#define APP_MOTOR_STEPS_PER_ENCODER_REV (0u)
+#endif
+#ifndef APP_MOTOR_POSITIVE_DIR_CW
+#define APP_MOTOR_POSITIVE_DIR_CW       (2u)
+#endif
+#ifndef APP_MOTOR_MOVE_TIMEOUT_MS
+#define APP_MOTOR_MOVE_TIMEOUT_MS       (0u)
+#endif
+#ifndef APP_MOTOR_STEP_INTERVAL_MS
+#define APP_MOTOR_STEP_INTERVAL_MS      (0u)
+#endif
+#ifndef APP_HOME_STEP_INTERVAL_MS
+#define APP_HOME_STEP_INTERVAL_MS       (0u)
+#endif
+#ifndef APP_HOME_SEARCH_STEPS
+#define APP_HOME_SEARCH_STEPS           (0u)
+#endif
+#ifndef APP_HOME_RELEASE_STEPS
+#define APP_HOME_RELEASE_STEPS          (0u)
+#endif
+#ifndef APP_HOME_SEARCH_TIMEOUT_MS
+#define APP_HOME_SEARCH_TIMEOUT_MS      (0u)
+#endif
+#ifndef APP_HOME_RELEASE_TIMEOUT_MS
+#define APP_HOME_RELEASE_TIMEOUT_MS     (0u)
+#endif
+#ifndef APP_MOTOR_STALL_TIMEOUT_MS
+#define APP_MOTOR_STALL_TIMEOUT_MS      (0u)
+#endif
+#ifndef APP_FLOOR_TWO_COUNTS
+#define APP_FLOOR_TWO_COUNTS            (0)
+#endif
+#ifndef APP_FLOOR_THREE_COUNTS
+#define APP_FLOOR_THREE_COUNTS          (0)
+#endif
+#ifndef APP_MOTOR_ARRIVAL_TOLERANCE_COUNTS
+#define APP_MOTOR_ARRIVAL_TOLERANCE_COUNTS (0u)
+#endif
 
 #endif /* APP_CFG_H */
 

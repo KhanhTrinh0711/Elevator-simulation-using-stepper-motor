@@ -14,9 +14,9 @@ CMSIS_DIR = bsp/CMSIS
 FREERTOS_DIR = middlewares/FreeRTOS/Source
 LINKER_SCRIPT = $(LINKER_DIR)/STM32F103C8.ld
 
-# Templates define alternative MSP/time bases and must not be built together.
+# Exclude alternative templates and unused LL utilities (HAL provides clocks).
 C_SOURCES = main.c $(wildcard bsp/*.c app/src/*.c) \
-    $(filter-out %_template.c,$(wildcard $(HAL_DIR)/src/*.c)) \
+    $(filter-out %_template.c %_ll_utils.c,$(wildcard $(HAL_DIR)/src/*.c)) \
     $(wildcard $(FREERTOS_DIR)/*.c) \
     $(FREERTOS_DIR)/portable/GCC/ARM_CM3/port.c \
     $(FREERTOS_DIR)/portable/MemMang/heap_4.c
@@ -29,7 +29,8 @@ CPPFLAGS = -DUSE_HAL_DRIVER -DSTM32F103xB \
     -I$(FREERTOS_DIR)/include -I$(FREERTOS_DIR)/portable/GCC/ARM_CM3
 CFLAGS = $(MCU) -std=c11 -O0 -g3 -Wall -Wextra \
     -ffunction-sections -fdata-sections -MMD -MP
-LDFLAGS = $(MCU) -T$(LINKER_SCRIPT) --specs=nano.specs --specs=nosys.specs \
+# ST Reset_Handler owns startup; omit generic crt0/exit/stdio teardown.
+LDFLAGS = $(MCU) -nostartfiles -T$(LINKER_SCRIPT) --specs=nano.specs --specs=nosys.specs \
     -Wl,--gc-sections -Wl,-Map=$(BUILD_DIR)/$(PROJECT).map \
     -Wl,--print-memory-usage
 

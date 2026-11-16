@@ -22,7 +22,6 @@ static uint8_t g_absent_polls = 0u;
 static TickType_t g_last_poll = 0u;
 static TickType_t g_wait_ticks = 0u;
 /* Shared copies are protected by critical sections, not volatile. */
-static task_rfid_context_t g_context = {0};
 static task_rfid_snapshot_t g_snapshot = {.status = HAL_RC522_NOT_READY};
 
 static bool rfid_context_valid (void);
@@ -61,10 +60,12 @@ task_rfid_set_context (const task_rfid_context_t * p_context)
     {
         return pdFAIL;
     }
-    taskENTER_CRITICAL();
-    g_context = *p_context;
-    taskEXIT_CRITICAL();
-    return pdPASS;
+    const app_input_context_t context = {
+        .authorization_epoch = p_context->authorization_epoch,
+        .admission_epoch = p_context->admission_epoch,
+        .b_admission_open = p_context->b_enabled
+    };
+    return app_ipc_input_context_publish(&context);
 }
 
 /** @brief Standalone adapter, mutually exclusive with InputTask polling. */
@@ -98,7 +99,7 @@ task_rfid_poll (void)
         gp_owner = p_caller;
     }
     const bool b_owner = (p_caller == gp_owner);
-    const task_rfid_context_t context = g_context;
+
     task_rfid_snapshot_t snapshot = g_snapshot;
     taskEXIT_CRITICAL();
     if (!b_owner)
@@ -106,6 +107,13 @@ task_rfid_poll (void)
         return pdFAIL;
     }
 
+    app_input_context_t shared = {0};
+    (void)app_ipc_input_context_read(&shared);
+    const task_rfid_context_t context = {
+        .authorization_epoch = shared.authorization_epoch,
+        .admission_epoch = shared.admission_epoch,
+        .b_enabled = shared.b_admission_open
+    };
     const TickType_t now = xTaskGetTickCount();
     /* Unsigned tick subtraction intentionally supports a tick rollover. */
     if ((TickType_t)(now - g_last_poll) < g_wait_ticks)
@@ -209,15 +217,21 @@ rfid_present (task_rfid_snapshot_t * p_snapshot,
     event.admission_epoch = p_context->admission_epoch;
     /* shortcut: accept any UID, add an allowlist when access rules are set. */
     event.b_authorized = true;
+    event.uid_length = p_snapshot->uid.length;
+    for (uint32_t idx = 0u; idx < event.uid_length; idx++)
+    {
+        event.uid[idx] = p_snapshot->uid.bytes[idx];
+    }
     p_snapshot->presentations++;
 
-    /* Compare and enqueue atomically against task-level admission updates.
-     * Elevator must additionally reject a latched hardware Emergency.
-     */
-    taskENTER_CRITICAL();
-    const bool b_current = (p_context->b_enabled && g_context.b_enabled &&
-        (p_context->admission_epoch == g_context.admission_epoch) &&
-        (p_context->authorization_epoch == g_context.authorization_epoch));
+    /* Elevator also rejects a latched Emergency and any later epoch change. */
+    app_input_context_t current = {0};
+    (void)app_ipc_input_context_read(&current);
+    /* Receiver rejects any epoch changed after this coherent copy. */
+    const bool b_current = (p_context->b_enabled &&
+        current.b_admission_open &&
+        (p_context->admission_epoch == current.admission_epoch) &&
+        (p_context->authorization_epoch == current.authorization_epoch));
     if (b_current && (pdPASS == xQueueSend(gh_input, &event, 0u)))
     {
         p_snapshot->sent_events++;
@@ -226,7 +240,6 @@ rfid_present (task_rfid_snapshot_t * p_snapshot,
     {
         p_snapshot->dropped_events++;
     }
-    taskEXIT_CRITICAL();
 }
 
 /** @brief Adapter only; production InputTask calls the same poll function. */
