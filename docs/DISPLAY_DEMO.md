@@ -1,97 +1,122 @@
-# DisplayTask: SSD1306 128x64 countdown
+# DisplayTask: trạng thái thang máy trên SSD1306
 
-Branch: `feature/task-display`, based on `develop`.
+Cập nhật 2026-11-16. Demo đếm 10..0 đã được thay bằng DisplayTask sản xuất.
+Tên tài liệu được giữ để các liên kết cũ vẫn dùng được.
 
-## Files and ownership
+## Hiển thị và quyền sở hữu
 
-- `app/inc/task_display.h`: creation API and countdown timing constants.
-- `app/src/task_display.c`: task creation, countdown and bounded error retry.
-- `hal/inc/hal_oled.h`: public OLED interface and fixed module configuration.
-- `hal/src/hal_oled.c`: controller commands and digit rendering.
+OLED SSD1306 128×64, địa chỉ I²C 7-bit 0x3C, hiển thị sáu dòng chữ ASCII:
 
-Public declarations belong in headers. Font storage, task handle and private
-helpers belong in C files under BARR-C 4.2.c / 1.8.a. No shared variables are
-defined in headers. HAL names and types keep the existing project exceptions.
-
-SSD1306 command source: [Solomon Systech datasheet, sections 8 and 10 and
-charge-pump application note](https://cdn-shop.adafruit.com/datasheets/SSD1306.pdf).
-This driver is for SSD1306, not SH1106, with an internal charge pump and a module
-power-on reset circuit. Address is the unshifted 7-bit value 0x3C.
-
-## Behavior
-
-Shows `10, 9, ..., 1, 0, 10, ...`. Each completed image is held for 1000 ms;
-I2C transfer time and scheduling add a small amount to the update interval.
-Zero is visible for one period. The driver clears the old digits, including
-the tens digit when changing from 10 to 9. Digits are enlarged 4x.
-
-One task owns OLED controller state. Data packets carry at most 16 pixels' column
-bytes plus one control byte. The existing BSP I2C mutex is released after each
-packet so the encoder can use the bus; do not create another OLED mutex.
-There is no full-screen framebuffer on the task stack.
-
-On initialization/draw failure, the task waits 1000 ms, reinitializes and retries
-the same count. It does not advance the count for a failed drawing. A missing
-OLED does not cause a tight loop, but a disconnected panel cannot display errors.
-
-Uses `APP_DISPLAY_PRIORITY` (1) and `APP_DISPLAY_STACK_WORDS` (256) from app_cfg.h.
-The 200 ms application display period is unchanged: this independent countdown
-uses its own 1000 ms interval. It does not consume DisplayQueue or drive LEDs.
-
-## Wiring
-
-- PB6 -> SCL; PB7 -> SDA; GND shared.
-- Use a module compatible with 3.3 V supply/logic and pull SDA/SCL up to 3.3 V.
-- The task waits 100 ms after scheduler start before initializing the panel.
-
-## Running on the board
-
-Per the task-development workflow, production main.c is not edited by this
-feature. `make` builds the source but the current main still runs the PC13 blink.
-For a dedicated kit experiment or the integration branch, use the following
-startup flow instead of the blink loop. Do not create the other motor test tasks
-for this isolated display experiment.
-
-```c
-#include "main.h"
-#include "stm32f1xx_hal.h"
-#include "bsp_i2c.h"
-#include "task_display.h"
-#include "task.h"
-
-int
-main (void)
-{
-    SystemCoreClockUpdate();
-    configASSERT(HAL_OK == HAL_Init());
-    configASSERT(HAL_OK == BSP_I2C1_Init());
-    configASSERT(pdPASS == task_display_create());
-
-    vTaskStartScheduler();
-    configASSERT(0);
-
-    for (;;)
-    {
-        /* Scheduler startup failed; stop for inspection. */
-    }
-}
+```text
+STATE: IDLE
+FLOOR: 1
+DIR: STOPPED
+QUEUE: 0
+RFID: 2.7 S
+READY: YES
 ```
 
-No IPC queue is required to run this standalone demo. For the final application,
-initialize IPC and other tasks before starting the scheduler as usual. Replace
-the countdown logic with snapshot consumption when integrating the elevator UI.
+- Hỗ trợ INIT/HOMING/IDLE/MOVING/ARRIVED/EMERGENCY.
+- FLOOR: ? khi current_floor = 0 (chưa xác định/giữa tầng).
+- QUEUE là số yêu cầu đang chờ, không tính currentTarget.
+- RFID là thời gian còn lại tại thời điểm vẽ, làm tròn lên 0.1 giây; không
+  tạo hay gia hạn quyền. Trong INIT/HOMING/EMERGENCY hiển thị 0.0 S.
+- LED xanh PB14 bật khi snapshot hợp lệ/còn mới, b_ready, IDLE, chiều STOPPED,
+  tầng đã biết và queue rỗng. Producer chịu trách nhiệm không đích/không khóa.
+- LED đỏ PB15 nháy khi Emergency, đảo mỗi 250 ms theo thời gian RTOS.
+- Không có snapshot, dữ liệu sai hoặc tuổi >= 1000 ms: NO DATA, tầng/chiều/
+  queue là ?, RFID 0.0 S và LED xanh tắt. Nếu trạng thái hợp lệ cuối là
+  Emergency, LED đỏ tiếp tục nháy tới khi có trạng thái mới hợp lệ.
 
-Check on hardware: both 10 and 0 are visible; 10->9 has no ghost digit; the count
-repeats; disconnected OLED does not starve other tasks; reconnection permits
-retry; measure `uxTaskGetStackHighWaterMark` before accepting the stack budget.
+Task chỉ hiển thị, không sửa FSM, không điều khiển motor hoặc cấp quyền RFID.
+Một mình DisplayTask sở hữu OLED và hai LED. Không chạy các test GPIO/RFID
+cũ có ghi LED đồng thời. LED không phải đường dừng khẩn cấp.
 
-## Validation performed during implementation
+## Hợp đồng mailbox
 
-- Firmware build and strict compilation of the two new C modules.
-- Temporary host mocks; no tests/ directory or test target added to the repo.
-- OLED mock verifies cleared RAM, distinct 0..10 images, no drawing outside
-  the number area, removal of the old tens digit, invalid argument rejection,
-  and propagation of errors at every initialization/draw transaction.
-- Task mock verifies invalid context/duplicate creation, retry delays, retaining
-  the value after errors, and the sequence 10..0 then 10.
-- These checks do not establish electrical operation or measured task stack use.
+Dùng APP_QUEUE_DISPLAY dài 1, đã được app_ipc_init tạo bằng sizeof của
+app_display_snapshot_t. Không thêm queue hay task.
+
+Snapshot được bổ sung timestamp_ticks. ElevatorTask phải cập nhật định kỳ
+ít nhất mỗi APP_DISPLAY_PERIOD_MS (200 ms), kể cả trạng thái không đổi;
+phát ngay khi chuyển trạng thái quan trọng. auth_remaining_ms được tính
+ở chính timestamp_ticks đó. Mọi module phải build lại với header mới.
+
+Ví dụ bên phát, chỉ dùng tại task điều phối hoặc harness kiểm tra:
+
+```c
+app_display_snapshot_t snapshot = {
+    .timestamp_ticks = xTaskGetTickCount(),
+    .state = APP_STATE_IDLE,
+    .direction = APP_DIRECTION_STOPPED,
+    .auth_remaining_ms = 0u,
+    .current_floor = 1u,
+    .waiting_count = 0u,
+    .b_ready = true
+};
+configASSERT(pdPASS == xQueueOverwrite(
+    app_ipc_queue(APP_QUEUE_DISPLAY), &snapshot));
+```
+
+Đây là dữ liệu giả lập. Khi tích hợp, không hardcode tầng 1 trước HOMING;
+producer lấy dữ liệu thực từ FSM và chỉ đặt b_ready khi mọi điều kiện đúng.
+Task nhận với xQueueReceive, giữ bản sao riêng và kiểm tra tuổi theo tick.
+Snapshot cũ không được dùng để khẳng định thang đang sẵn sàng.
+
+## Khởi tạo
+
+Sau HAL_Init và cấu hình clock, trước scheduler:
+
+```c
+configASSERT(HAL_OK == BSP_I2C1_Init());
+configASSERT(pdPASS == app_ipc_init());
+configASSERT(pdPASS == task_display_create());
+/* Tạo task điều phối/publisher và các task khác trước scheduler. */
+vTaskStartScheduler();
+```
+
+Header cần dùng: stm32f1xx_hal.h, bsp_i2c.h, app_ipc.h, task_display.h, task.h.
+DisplayTask tự cấu hình riêng PB14/PB15 output active-high, ban đầu tắt;
+không gọi BSP_GPIO_Init để tránh tác động motor/IRQ trong test độc lập.
+Trong ứng dụng, khởi tạo board trước khi tạo task; không reinit GPIO lúc chạy.
+
+Giữ priority 1, stack khởi điểm 256 words. Chờ nguồn OLED 100 ms; kiểm tra
+mailbox/LED mỗi 50 ms, làm mới OLED khoảng 200 ms sau lần vẽ thành công.
+Lỗi init/vẽ: ngừng lượt vẽ, chờ tối thiểu 1000 ms rồi init lại, dùng snapshot
+mới nhất; trong thời gian chờ vẫn phục vụ mailbox và LED.
+
+Tốc độ này là mục tiêu best effort. Thời gian I²C và preemption làm tăng độ
+trễ hiển thị/LED; không dùng nó làm cam kết deadline dừng motor.
+
+## Driver và nối dây
+
+PB6 SCL, PB7 SDA, nguồn/logic phù hợp 3.3 V, GND chung, pull-up I²C 3.3 V.
+Module giả định có reset nguồn riêng và charge pump nội. Không dùng SH1106.
+
+hal_oled_write_line(row, text) ghi một hàng 8 pixel, tối đa 21 ký tự, xóa cả
+phần còn lại để không lưu chữ cũ khi chuỗi ngắn đi. Chữ hoa, số, dấu hai chấm,
+chấm, gạch ngang và ?; ký tự khác hiện ?. Row ngoài 0..7, NULL hoặc chuỗi quá
+21 ký tự bị từ chối trước khi giao dịch. Chuỗi phải kết thúc bằng NUL.
+
+Mỗi gói dữ liệu tối đa 16 byte + control byte, trả mutex I²C giữa các gói để
+AS5600 dùng bus. Không cấp framebuffer 1024 byte trên stack. API đếm số cũ
+hal_oled_show_count được giữ cho caller chẩn đoán, không được DisplayTask gọi.
+Không trộn các renderer từ nhiều task.
+
+Lệnh SSD1306 giữ nguyên từ driver trước; tham khảo [datasheet SSD1306,
+sections 8 và 10](https://cdn-shop.adafruit.com/datasheets/SSD1306.pdf).
+
+## Kiểm tra và giới hạn
+
+Kiểm tra host bằng mock tạm ngoài repo: mặc định NO DATA, nhận snapshot IDLE,
+đếm lùi RFID theo timestamp, LED Emergency khi OLED lỗi, hết hạn dữ liệu,
+snapshot sai, retry init; driver kiểm tra giới hạn hàng/chuỗi, ký tự thay thế,
+xóa đuôi chữ và trả lỗi tại từng giao dịch.
+
+Build firmware mặc định vẫn chạy PC13 blink, không gọi DisplayTask. Kiểm tra
+link giữ API display giúp phát hiện lỗi liên kết mà linker GC có thể che đi;
+không thay thế nạp kit. main.c sản xuất chỉ ghép ở nhánh integration theo plan.
+
+Cần đo trên kit: hướng OLED, chữ đọc được, LED active-high, độ trễ nháy khi
+OLED mất kết nối, jitter encoder khi chung bus, stack high-water mark.
+Không tạo tests/ hoặc make check trong lần cập nhật này.

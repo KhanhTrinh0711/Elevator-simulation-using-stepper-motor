@@ -143,9 +143,13 @@ typedef enum
  * DisplayTask owns OLED and LEDs. current_floor is 0 when unknown or
  * between floors, otherwise 1..3. b_ready includes IDLE, empty waiting
  * queue, no target, no lock and no emergency.
+ * timestamp_ticks is sampled when published. Send at least every
+ * APP_DISPLAY_PERIOD_MS, including unchanged states. auth_remaining_ms is
+ * relative to that timestamp, clamped to APP_AUTH_WINDOW_MS by the producer.
  */
 typedef struct
 {
+    TickType_t      timestamp_ticks;
     app_state_t     state;
     app_direction_t direction;
     uint32_t        auth_remaining_ms;

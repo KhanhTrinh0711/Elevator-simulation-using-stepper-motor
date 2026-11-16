@@ -4,6 +4,7 @@
  * See docs/DISPLAY_DEMO.md for the source and board assumptions.
  */
 #include "hal_oled.h"
+#include <stddef.h>
 #include "bsp_i2c.h"
 
 #define OLED_PAGE_HEIGHT       (8u)
@@ -42,6 +43,38 @@ static const uint8_t g_digits[OLED_DIGIT_COUNT][OLED_GLYPH_WIDTH] =
     {0x06u, 0x49u, 0x49u, 0x29u, 0x1Eu}
 };
 
+/* Original 5x7 uppercase glyphs, columns with bit zero at the top. */
+static const uint8_t g_letters[26u][OLED_GLYPH_WIDTH] =
+{
+    {0x7Eu, 0x09u, 0x09u, 0x09u, 0x7Eu},
+    {0x7Fu, 0x49u, 0x49u, 0x49u, 0x36u},
+    {0x3Eu, 0x41u, 0x41u, 0x41u, 0x22u},
+    {0x7Fu, 0x41u, 0x41u, 0x22u, 0x1Cu},
+    {0x7Fu, 0x49u, 0x49u, 0x49u, 0x41u},
+    {0x7Fu, 0x09u, 0x09u, 0x09u, 0x01u},
+    {0x3Eu, 0x41u, 0x49u, 0x49u, 0x3Au},
+    {0x7Fu, 0x08u, 0x08u, 0x08u, 0x7Fu},
+    {0x41u, 0x41u, 0x7Fu, 0x41u, 0x41u},
+    {0x20u, 0x40u, 0x41u, 0x3Fu, 0x01u},
+    {0x7Fu, 0x08u, 0x14u, 0x22u, 0x41u},
+    {0x7Fu, 0x40u, 0x40u, 0x40u, 0x40u},
+    {0x7Fu, 0x02u, 0x0Cu, 0x02u, 0x7Fu},
+    {0x7Fu, 0x04u, 0x08u, 0x10u, 0x7Fu},
+    {0x3Eu, 0x41u, 0x41u, 0x41u, 0x3Eu},
+    {0x7Fu, 0x09u, 0x09u, 0x09u, 0x06u},
+    {0x3Eu, 0x41u, 0x51u, 0x21u, 0x5Eu},
+    {0x7Fu, 0x09u, 0x19u, 0x29u, 0x46u},
+    {0x26u, 0x49u, 0x49u, 0x49u, 0x32u},
+    {0x01u, 0x01u, 0x7Fu, 0x01u, 0x01u},
+    {0x3Fu, 0x40u, 0x40u, 0x40u, 0x3Fu},
+    {0x1Fu, 0x20u, 0x40u, 0x20u, 0x1Fu},
+    {0x3Fu, 0x40u, 0x38u, 0x40u, 0x3Fu},
+    {0x63u, 0x14u, 0x08u, 0x14u, 0x63u},
+    {0x03u, 0x04u, 0x78u, 0x04u, 0x03u},
+    {0x61u, 0x51u, 0x49u, 0x45u, 0x43u}
+};
+
+static uint8_t oled_text_column (char character, uint32_t column);
 static HAL_StatusTypeDef oled_set_cursor (uint8_t page, uint8_t column);
 static HAL_StatusTypeDef oled_clear (void);
 static uint8_t oled_render_byte (uint8_t count, uint32_t column,
@@ -121,6 +154,82 @@ hal_oled_show_count (uint8_t count)
     }
 
     return HAL_OK;
+}
+
+/** @brief Stream a complete row in 16-byte chunks without a framebuffer. */
+HAL_StatusTypeDef
+hal_oled_write_line (uint8_t row, const char * p_text)
+{
+    if ((HAL_OLED_TEXT_ROWS <= row) || (NULL == p_text))
+    {
+        return HAL_ERROR;
+    }
+    uint32_t length = 0u;
+    while ((HAL_OLED_TEXT_COLUMNS >= length) && ('\0' != p_text[length]))
+    {
+        length++;
+    }
+    if (HAL_OLED_TEXT_COLUMNS < length)
+    {
+        return HAL_ERROR;
+    }
+    HAL_StatusTypeDef status = oled_set_cursor(row, 0u);
+    if (HAL_OK != status)
+    {
+        return status;
+    }
+    for (uint32_t offset = 0u; offset < HAL_OLED_WIDTH;
+         offset += OLED_CHUNK_SIZE)
+    {
+        uint8_t packet[OLED_CHUNK_SIZE + 1u] = {OLED_DATA_CONTROL};
+        for (uint32_t idx = 0u; idx < OLED_CHUNK_SIZE; idx++)
+        {
+            const uint32_t column = offset + idx;
+            const uint32_t letter = column / (OLED_GLYPH_WIDTH + 1u);
+            if (letter < length)
+            {
+                packet[idx + 1u] = oled_text_column(p_text[letter],
+                    column % (OLED_GLYPH_WIDTH + 1u));
+            }
+        }
+        status = BSP_I2C1_Write(HAL_OLED_ADDRESS, packet, sizeof(packet));
+        if (HAL_OK != status)
+        {
+            return status;
+        }
+    }
+    return HAL_OK;
+}
+
+/** @brief Return a column or a blank separator, with '?' as fallback. */
+static uint8_t
+oled_text_column (char character, uint32_t column)
+{
+    static const uint8_t question[OLED_GLYPH_WIDTH] =
+        {0x02u, 0x01u, 0x51u, 0x09u, 0x06u};
+    if ((OLED_GLYPH_WIDTH <= column) || (' ' == character))
+    {
+        return 0u;
+    }
+    if ((character >= '0') && (character <= '9'))
+    {
+        return g_digits[character - '0'][column];
+    }
+    if ((character >= 'A') && (character <= 'Z'))
+    {
+        return g_letters[character - 'A'][column];
+    }
+    switch (character)
+    {
+        case ':':
+            return (2u == column) ? 0x24u : 0u;
+        case '-':
+            return 0x08u;
+        case '.':
+            return (2u == column) ? 0x40u : 0u;
+        default:
+            return question[column];
+    }
 }
 
 /** @brief Set a page-mode cursor using bounded internal coordinates. */

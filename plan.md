@@ -49,7 +49,7 @@ Rà soát cục bộ tại ngày cập nhật; không dùng danh sách này đ�
 | BSP/HAL, CMSIS, FreeRTOS, startup, linker, Makefile | Đã có | Kiểm chứng phần cứng và xử lý lỗi khi tích hợp |
 | app_cfg.h, app_ipc.h/.c | 5 task dự kiến, 6 queue | Hoàn thiện hợp đồng recovery, công tắc và phiên input |
 | Stepper, AS5600, MotorTask | Đã có code | Hiệu chỉnh cơ khí và đổi HOME sang tìm mốc tự động |
-| OLED, task_display | Demo đếm 10 về 0 rồi lặp | Chuyển sang hiển thị snapshot hệ thống |
+| OLED, task_display | Hiển thị snapshot/FSM/RFID, LED và xử lý dữ liệu cũ | Ghép publisher ElevatorTask, đo trên kit |
 | RC522, task_rfid_test | Driver, lọc lần đưa thẻ, AUTH queue và API poll cho InputTask | Ghép InputTask/ElevatorTask, kiểm chứng kit; whitelist hoãn |
 | EmergencyTask, ElevatorTask, InputTask sản xuất | Chưa thấy module tương ứng | Triển khai theo các bước dưới |
 | main.c | Nháy PC13, chưa chạy scheduler | Chỉ ghép hệ thống ở nhánh integration |
@@ -301,3 +301,5 @@ Không tạo lại tests/ hoặc make check trong kế hoạch này. Tiếp tụ
 - 2026-11-15: Tạo bản kế hoạch tổng hợp trong repo, thay thế bản kế hoạch cũ làm tài liệu làm việc. Giữ báo cáo/quy trình làm nguồn, cập nhật phân công và quyết định công tắc tầng 1, Emergency 10 giây rồi HOMING; phân biệt rõ code hiện có với thiết kế mục tiêu và nghiệm thu còn thiếu.
 
 - 2026-11-15: Leader chốt tạm thời nhận mọi thẻ đọc được UID hợp lệ, mở cửa sổ nút tầng 3 giây; chưa áp dụng whitelist. Giữ thẻ không tự gia hạn.
+
+- 2026-11-16: DisplayTask chuyển từ demo đếm sang mailbox trạng thái; thêm timestamp_ticks vào app_display_snapshot_t. Publisher phát mỗi 200 ms; snapshot quá 1000 ms hiển thị NO DATA, không báo sẵn sàng. Đã có code, chưa đánh dấu nghiệm thu P10 trên kit.
