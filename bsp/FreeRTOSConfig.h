@@ -5,6 +5,7 @@
 #define FREERTOS_CONFIG_H
 
 #include "stm32f1xx.h"
+#include "bsp_fault.h"
 
 #define configUSE_PREEMPTION                     1u
 #define configCPU_CLOCK_HZ                       SystemCoreClock
@@ -53,11 +54,7 @@
     {                                       \
         if (!(condition))                   \
         {                                   \
-            __disable_irq();                \
-            for (;;)                        \
-            {                               \
-                /* Wait for the debugger. */\
-            }                               \
+            bsp_fault_stop();               \
         }                                   \
     } while (0)
 

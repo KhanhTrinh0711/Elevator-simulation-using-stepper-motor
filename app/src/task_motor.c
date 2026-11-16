@@ -1,1005 +1,526 @@
-/**
- * @file task_motor.c
- * @brief MotorTask command execution and AS5600 position monitoring.
- *
- * MotorTask is the sole application-level owner of the stepper driver and
- * AS5600 position update API. I2C serialization is provided by the BSP.
+/** @file task_motor.c
+ * @brief Sole owner of motion, encoder samples and bounded floor-1 homing.
  */
-
 #include "task_motor.h"
-
 #include <stdbool.h>
 #include <stdint.h>
-
+#include <limits.h>
 #include "app_cfg.h"
 #include "app_ipc.h"
 #include "hal_as5600.h"
 #include "hal_stepper.h"
-#include "queue.h"
+#include "task_emergency.h"
 #include "task.h"
 
-#if (APP_POSITION_MAX_GAP_MS < APP_POSITION_PERIOD_MS)
-#error "Encoder maximum sample gap must be >= sample period"
-#endif
+#define MOTOR_REPORT_SLOTS (2u)
 
-#if (APP_MOTOR_HOME_TIMEOUT_MS == 0u)
-#error "APP_MOTOR_HOME_TIMEOUT_MS must be non-zero"
-#endif
+typedef enum
+{
+    MOTOR_IDLE = 0,
+    MOTOR_MOVE,
+    MOTOR_RELEASE,
+    MOTOR_RELEASE_SETTLE,
+    MOTOR_SEARCH,
+    MOTOR_VERIFY
+} motor_phase_t;
 
-#if (APP_MOTOR_HOME_STABLE_SAMPLES == 0u)
-#error "APP_MOTOR_HOME_STABLE_SAMPLES must be non-zero"
-#endif
-
-#if (APP_MOTOR_MECHANICS_CALIBRATED == 1u)
-#if (APP_MOTOR_STEPS_PER_ENCODER_REV == 0u)
-#error "Configure measured stepper steps per encoder revolution"
-#endif
-#if (APP_MOTOR_MOVE_TIMEOUT_MS == 0u)
-#error "Configure a non-zero motor move timeout"
-#endif
-#if (APP_MOTOR_POSITIVE_DIR_CW > 1u)
-#error "Configure the measured positive encoder direction"
-#endif
-#endif
-
-/**
- * @brief Private MotorTask runtime data.
- */
 typedef struct
 {
-    QueueHandle_t command_queue;
-    QueueHandle_t report_queue;
-    QueueHandle_t position_queue;
-
-    bool b_sensor_initialized;
-    bool b_magnet_detected;
-    bool b_sample_valid;
-    bool b_reference_valid;
+    motor_phase_t phase;
+    bool b_sensor;
+    bool b_sample;
+    bool b_reference;
     bool b_have_sample;
+    int32_t position;
+    int32_t target;
+    int32_t start;
+    int32_t progress;
+    TickType_t sample_start;
+    TickType_t sample_time;
+    TickType_t retry;
+    TickType_t started;
+    TickType_t progress_time;
+    TickType_t settled;
+    bool b_settling;
+    uint32_t command_id;
+    uint32_t last_id;
+    uint32_t generation;
+    app_motor_report_t reports[MOTOR_REPORT_SLOTS];
+    uint32_t report_count;
+} motor_context_t;
 
-    TickType_t last_sample_ticks;
-    TickType_t last_magnet_check_ticks;
-    TickType_t last_init_attempt_ticks;
+static TaskHandle_t gp_motor = NULL;
+static motor_context_t g_motor;
+static QueueHandle_t gh_commands = NULL;
+static QueueHandle_t gh_reports = NULL;
+static QueueHandle_t gh_position = NULL;
 
-    bool b_motion_active;
-    uint32_t motion_command_id;
-    int32_t motion_start_counts;
-    int32_t motion_target_counts;
-    TickType_t motion_start_ticks;
+static void motor_task (void * p_argument);
+static void motor_sample (motor_context_t * p_motor);
+static void motor_report (motor_context_t * p_motor,
+                          app_motor_result_t result, uint32_t id);
+static void motor_finish (motor_context_t * p_motor,
+                          app_motor_result_t result);
+static bool motor_start (motor_context_t * p_motor, uint32_t steps,
+                         bool b_up, bool b_home);
+static void motor_command (motor_context_t * p_motor);
+static void motor_update (motor_context_t * p_motor);
+static void motor_home_update (motor_context_t * p_motor, TickType_t now);
+static void motor_fail (motor_context_t * p_motor);
 
-    bool b_home_pending;
-    uint32_t home_command_id;
-    uint32_t home_stable_samples;
-    int32_t home_previous_counts;
-    TickType_t home_start_ticks;
-
-    bool b_emergency_seen;
-
-    bool b_report_pending;
-    app_motor_report_t pending_report;
-} task_motor_context_t;
-
-/* Task handle is retained to prevent duplicate task creation. */
-static TaskHandle_t g_motor_task_handle = NULL;
-
-/* Static storage is zero-initialized before the scheduler starts. */
-static task_motor_context_t g_motor_context;
-
-/* Private function declarations. */
-static void task_motor_entry(void *argument);
-static void task_motor_try_sensor_init(task_motor_context_t *context,
-                                       TickType_t now);
-static bool task_motor_sample_encoder(task_motor_context_t *context,
-                                      TickType_t now);
-static void task_motor_publish_position(task_motor_context_t *context,
-                                        TickType_t now,
-                                        bool b_sample_ok);
-static void task_motor_set_priority(bool b_active);
-static void task_motor_record_report(task_motor_context_t *context,
-                                     app_motor_result_t result,
-                                     uint32_t command_id);
-static void task_motor_flush_report(task_motor_context_t *context);
-static void task_motor_handle_emergency(task_motor_context_t *context);
-static void task_motor_receive_command(task_motor_context_t *context,
-                                       TickType_t now,
-                                       bool b_sample_ok);
-static void task_motor_process_command(task_motor_context_t *context,
-                                       const app_motor_command_t *command,
-                                       TickType_t now,
-                                       bool b_sample_ok);
-static void task_motor_start_move(task_motor_context_t *context,
-                                  const app_motor_command_t *command,
-                                  TickType_t now,
-                                  bool b_sample_ok);
-static void task_motor_start_home(task_motor_context_t *context,
-                                  const app_motor_command_t *command,
-                                  TickType_t now,
-                                  bool b_sample_ok);
-static void task_motor_update_move(task_motor_context_t *context,
-                                   TickType_t now,
-                                   bool b_sample_ok);
-static void task_motor_update_home(task_motor_context_t *context,
-                                   TickType_t now,
-                                   bool b_sample_ok);
-static bool task_motor_target_reached(const task_motor_context_t *context,
-                                      int32_t current_counts);
-
-/**
- * @brief Create MotorTask.
- *
- * The IPC queues must have been created before this function is called.
- *
- * @return pdPASS when the task is created; pdFAIL otherwise.
- */
-BaseType_t task_motor_create(void)
+/** @brief A zero unconfigured bound expires immediately if reached. */
+static bool
+motor_expired (TickType_t now, TickType_t start, uint32_t timeout_ms)
 {
-    BaseType_t result;
+    return ((TickType_t)(now - start) >= pdMS_TO_TICKS(timeout_ms));
+}
 
-    if (NULL != g_motor_task_handle)
+/** @brief Measurements must be complete before any autonomous motion. */
+bool
+task_motor_configured (void)
+{
+    return ((1u == APP_MOTOR_MECHANICS_CALIBRATED) &&
+        (0u < APP_MOTOR_STEPS_PER_ENCODER_REV) &&
+        (1u >= APP_MOTOR_POSITIVE_DIR_CW) &&
+        (0u < APP_MOTOR_MOVE_TIMEOUT_MS) &&
+        (0u < APP_MOTOR_STEP_INTERVAL_MS) &&
+        (UINT16_MAX >= APP_MOTOR_STEP_INTERVAL_MS) &&
+        (0u < APP_HOME_STEP_INTERVAL_MS) &&
+        (UINT16_MAX >= APP_HOME_STEP_INTERVAL_MS) &&
+        (0u < APP_HOME_SEARCH_STEPS) && (0u < APP_HOME_RELEASE_STEPS) &&
+        (0u < APP_HOME_SEARCH_TIMEOUT_MS) &&
+        (0u < APP_HOME_RELEASE_TIMEOUT_MS) &&
+        (0u < APP_MOTOR_STALL_TIMEOUT_MS) &&
+        (0 < APP_FLOOR_TWO_COUNTS) &&
+        (APP_FLOOR_TWO_COUNTS < APP_FLOOR_THREE_COUNTS));
+}
+
+BaseType_t
+task_motor_create (void)
+{
+    if ((NULL != gp_motor) || (0u != __get_IPSR()) ||
+        (0u != __get_PRIMASK()) || (0u != __get_BASEPRI()) ||
+        (taskSCHEDULER_NOT_STARTED != xTaskGetSchedulerState()))
     {
         return pdFAIL;
     }
-
-    g_motor_context.command_queue =
-        app_ipc_queue(APP_QUEUE_MOTOR_COMMAND);
-    g_motor_context.report_queue =
-        app_ipc_queue(APP_QUEUE_MOTOR_REPORT);
-    g_motor_context.position_queue =
-        app_ipc_queue(APP_QUEUE_POSITION);
-
-    if ((NULL == g_motor_context.command_queue) ||
-        (NULL == g_motor_context.report_queue) ||
-        (NULL == g_motor_context.position_queue))
+    gh_commands = app_ipc_queue(APP_QUEUE_MOTOR_COMMAND);
+    gh_reports = app_ipc_queue(APP_QUEUE_MOTOR_REPORT);
+    gh_position = app_ipc_queue(APP_QUEUE_POSITION);
+    if ((NULL == gh_commands) || (NULL == gh_reports) ||
+        (NULL == gh_position))
     {
         return pdFAIL;
     }
-
-    result = xTaskCreate(task_motor_entry,
-                         "MOTOR_TASK",
-                         APP_MOTOR_STACK_WORDS,
-                         NULL,
-                         APP_MOTOR_PRIORITY_IDLE,
-                         &g_motor_task_handle);
-
-    if (pdPASS != result)
-    {
-        g_motor_task_handle = NULL;
-    }
-
-    return result;
+    g_motor.generation = Stepper_EmergencyGeneration();
+    return xTaskCreate(motor_task, "Motor", APP_MOTOR_STACK_WORDS, NULL,
+                       APP_MOTOR_PRIORITY_IDLE, &gp_motor);
 }
 
-/**
- * @brief MotorTask entry point.
- *
- * Samples the encoder periodically, publishes the latest position and
- * handles commands. Emergency hardware shutdown is performed by the
- * emergency ISR; this task handles software cancellation and reporting.
- *
- * @param argument Unused task argument.
- */
-static void task_motor_entry(void *argument)
+/** @brief Keep terminal reports until delivery without overwriting. */
+static void
+motor_report (motor_context_t * p_motor, app_motor_result_t result,
+              uint32_t id)
 {
-    TickType_t last_wake_time;
-    TickType_t now;
-    bool b_sample_ok;
+    configASSERT(p_motor->report_count < MOTOR_REPORT_SLOTS);
+    app_motor_report_t * p_report = &p_motor->reports[p_motor->report_count];
+    p_report->command_id = id;
+    p_report->result = result;
+    p_report->position.direction = APP_DIRECTION_STOPPED;
+    p_report->position.counts = p_motor->position;
+    p_report->position.timestamp_ticks = p_motor->sample_time;
+    p_report->position.b_sensor_valid = p_motor->b_sample;
+    p_report->position.b_valid = p_motor->b_sample && p_motor->b_reference;
+    p_motor->report_count++;
+}
 
-    (void)argument;
+/** @brief Return to idle only after reserving the terminal result. */
+static void
+motor_finish (motor_context_t * p_motor, app_motor_result_t result)
+{
+    Stepper_Stop();
+    motor_report(p_motor, result, p_motor->command_id);
+    p_motor->phase = MOTOR_IDLE;
+    vTaskPrioritySet(NULL, APP_MOTOR_PRIORITY_IDLE);
+}
 
-    last_wake_time = xTaskGetTickCount();
-
-    for (;;)
+static void
+motor_fail (motor_context_t * p_motor)
+{
+    p_motor->b_reference = false;
+    if (0u != Stepper_IsEmergencyLatched())
     {
-        vTaskDelayUntil(&last_wake_time,
-                        pdMS_TO_TICKS(APP_POSITION_PERIOD_MS));
-
-        now = xTaskGetTickCount();
-
-        if (false == g_motor_context.b_sensor_initialized)
-        {
-            task_motor_try_sensor_init(&g_motor_context, now);
-        }
-
-        b_sample_ok =
-            task_motor_sample_encoder(&g_motor_context, now);
-
-        task_motor_publish_position(&g_motor_context,
-                                    now,
-                                    b_sample_ok);
-
-        task_motor_flush_report(&g_motor_context);
-
-        if (0u != Stepper_IsEmergencyLatched())
-        {
-            task_motor_handle_emergency(&g_motor_context);
-
-            /*
-             * During Emergency, only HOME is accepted. HOME is a
-             * stationary reference confirmation and never starts motion.
-             */
-            if (g_motor_context.b_home_pending)
-            {
-                task_motor_update_home(&g_motor_context,
-                                       now,
-                                       b_sample_ok);
-            }
-            else if (false == g_motor_context.b_report_pending)
-            {
-                task_motor_receive_command(&g_motor_context,
-                                           now,
-                                           b_sample_ok);
-            }
-        }
-        else
-        {
-            g_motor_context.b_emergency_seen = false;
-
-            if (g_motor_context.b_home_pending)
-            {
-                /* A reference-confirmation operation must remain in
-                 * Emergency. Cancel it if Emergency was released early.
-                 */
-                g_motor_context.b_home_pending = false;
-                task_motor_set_priority(false);
-                task_motor_record_report(&g_motor_context,
-                                         APP_MOTOR_ERROR,
-                                         g_motor_context.home_command_id);
-            }
-
-            if (g_motor_context.b_motion_active)
-            {
-                task_motor_update_move(&g_motor_context,
-                                       now,
-                                       b_sample_ok);
-            }
-
-            if (false == g_motor_context.b_report_pending)
-            {
-                task_motor_receive_command(&g_motor_context,
-                                           now,
-                                           b_sample_ok);
-            }
-        }
-
-        task_motor_flush_report(&g_motor_context);
+        motor_finish(p_motor, APP_MOTOR_STOPPED);
+    }
+    else
+    {
+        task_emergency_block_recovery();
+        motor_finish(p_motor, APP_MOTOR_ERROR);
     }
 }
 
-/**
- * @brief Attempt to initialize AS5600 from task context.
- *
- * Initialization establishes an angle-tracking baseline only. It does not
- * establish the elevator's floor reference.
- *
- * @param context MotorTask runtime data.
- * @param now Current RTOS tick.
- */
-static void task_motor_try_sensor_init(task_motor_context_t *context,
-                                      TickType_t now)
+/** @brief Include bus wait in sample validity, not just loop start times. */
+static void
+motor_sample (motor_context_t * p_motor)
 {
-    HAL_StatusTypeDef status;
-    uint8_t magnet_detected;
+    TickType_t start = xTaskGetTickCount();
+    p_motor->b_sample = false;
+    if (!p_motor->b_sensor)
+    {
+        if ((TickType_t)(start - p_motor->retry) <
+            pdMS_TO_TICKS(APP_SENSOR_RETRY_MS))
+        {
+            return;
+        }
+        p_motor->retry = start;
+        p_motor->b_reference = false;
+        p_motor->b_have_sample = false;
+        p_motor->b_sensor = (HAL_OK == HAL_AS5600_Init());
+        if (!p_motor->b_sensor)
+        {
+            return;
+        }
+    }
+    start = xTaskGetTickCount();
+    uint8_t magnet = 0u;
+    const HAL_StatusTypeDef angle = HAL_AS5600_UpdatePosition();
+    const HAL_StatusTypeDef field = HAL_AS5600_IsMagnetDetected(&magnet);
+    const TickType_t finish = xTaskGetTickCount();
+    /* From the previous read START to this read END is a conservative bound. */
+    const TickType_t since = p_motor->b_have_sample ?
+                             p_motor->sample_start : start;
+    p_motor->b_sample = ((HAL_OK == angle) && (HAL_OK == field) &&
+        (0u != magnet) && ((TickType_t)(finish - since) <=
+                          pdMS_TO_TICKS(APP_POSITION_MAX_GAP_MS)));
+    p_motor->sample_start = start;
+    p_motor->sample_time = finish;
+    p_motor->b_have_sample = true;
+    if (!p_motor->b_sample)
+    {
+        p_motor->b_reference = false;
+        p_motor->b_sensor = false;
+    }
+    if (HAL_OK == angle)
+    {
+        p_motor->position = HAL_AS5600_GetPosition();
+    }
+}
 
-    if ((TickType_t)(now - context->last_init_attempt_ticks) <
-        pdMS_TO_TICKS(APP_RFID_PERIOD_MS))
+/** @brief Direction uses the measured mapping; downward motion guards PA1. */
+static bool
+motor_start (motor_context_t * p_motor, uint32_t steps,
+              bool b_up, bool b_home)
+{
+    const bool b_clockwise = (b_up == (1u == APP_MOTOR_POSITIVE_DIR_CW));
+    const uint32_t interval = b_home ? APP_HOME_STEP_INTERVAL_MS :
+                                      APP_MOTOR_STEP_INTERVAL_MS;
+    /* Config validation guarantees interval fits the 16-bit timer count. */
+    if (HAL_OK != Stepper_StartMotion(steps,
+            b_clockwise ? STEPPER_DIR_CW : STEPPER_DIR_CCW,
+            (uint16_t)interval, !b_up))
+    {
+        return false;
+    }
+    p_motor->started = xTaskGetTickCount();
+    p_motor->start = p_motor->position;
+    p_motor->progress = p_motor->position;
+    p_motor->progress_time = p_motor->started;
+    p_motor->b_settling = false;
+    vTaskPrioritySet(NULL, APP_MOTOR_PRIORITY_ACTIVE);
+    return true;
+}
+
+/** @brief Two slots retain a rejection and the active command result. */
+static void
+motor_command (motor_context_t * p_motor)
+{
+    if (0u != p_motor->report_count)
     {
         return;
     }
-
-    context->last_init_attempt_ticks = now;
-
-    status = HAL_AS5600_Init();
-
-    if (HAL_OK != status)
+    app_motor_command_t command = {0};
+    if (pdPASS != xQueueReceive(gh_commands, &command, 0u))
     {
         return;
     }
-
-    context->b_sensor_initialized = true;
-    context->b_have_sample = false;
-    context->b_sample_valid = false;
-    context->b_reference_valid = false;
-
-    status = HAL_AS5600_IsMagnetDetected(&magnet_detected);
-
-    if ((HAL_OK == status) && (0u != magnet_detected))
+    const uint32_t difference = command.command_id - p_motor->last_id;
+    if ((0u == difference) || (difference >= (UINT32_MAX / 2u)))
     {
-        context->b_magnet_detected = true;
+        motor_report(p_motor, APP_MOTOR_ERROR, command.command_id);
+        return;
     }
-    else
+    p_motor->last_id = command.command_id;
+    if (APP_MOTOR_STOP == command.action)
     {
-        context->b_magnet_detected = false;
-    }
-
-    context->last_sample_ticks = now;
-    context->last_magnet_check_ticks = now;
-}
-
-/**
- * @brief Read encoder and validate sample continuity.
- *
- * If the interval between successful samples is too long, the multi-turn
- * count is no longer trusted. A later stationary HOME operation is required
- * to establish a new reference.
- *
- * @param context MotorTask runtime data.
- * @param now Current RTOS tick.
- * @return true when this sample is valid.
- */
-static bool task_motor_sample_encoder(task_motor_context_t *context,
-                                      TickType_t now)
-{
-    HAL_StatusTypeDef status;
-    uint8_t magnet_detected;
-    bool b_interval_valid;
-
-    if (false == context->b_sensor_initialized)
-    {
-        context->b_sample_valid = false;
-        return false;
-    }
-
-    status = HAL_AS5600_UpdatePosition();
-
-    if (HAL_OK != status)
-    {
-        context->b_sample_valid = false;
-        context->b_reference_valid = false;
-        return false;
-    }
-
-    b_interval_valid = true;
-
-    if (context->b_have_sample)
-    {
-        if ((TickType_t)(now - context->last_sample_ticks) >
-            pdMS_TO_TICKS(APP_POSITION_MAX_GAP_MS))
+        if (MOTOR_IDLE != p_motor->phase)
         {
-            b_interval_valid = false;
-        }
-    }
-
-    context->last_sample_ticks = now;
-    context->b_have_sample = true;
-
-    if ((TickType_t)(now - context->last_magnet_check_ticks) >=
-        pdMS_TO_TICKS(APP_MOTOR_MAGNET_CHECK_PERIOD_MS))
-    {
-        status = HAL_AS5600_IsMagnetDetected(&magnet_detected);
-        context->last_magnet_check_ticks = now;
-
-        if ((HAL_OK == status) && (0u != magnet_detected))
-        {
-            context->b_magnet_detected = true;
+            motor_finish(p_motor, APP_MOTOR_STOPPED);
         }
         else
         {
-            context->b_magnet_detected = false;
+            motor_report(p_motor, APP_MOTOR_STOPPED, command.command_id);
         }
+        return;
     }
-
-    context->b_sample_valid =
-        b_interval_valid && context->b_magnet_detected;
-
-    if (false == context->b_sample_valid)
+    if ((MOTOR_IDLE != p_motor->phase) || (!task_motor_configured()) ||
+        (!p_motor->b_sample) || (0u != Stepper_IsEmergencyLatched()))
     {
-        context->b_reference_valid = false;
+        motor_report(p_motor, APP_MOTOR_ERROR, command.command_id);
+        return;
     }
-
-    return context->b_sample_valid;
-}
-
-/**
- * @brief Publish the newest encoder sample.
- *
- * PositionQueue is a one-element mailbox, so the newest sample replaces
- * the previous one.
- *
- * @param context MotorTask runtime data.
- * @param now Current RTOS tick.
- * @param b_sample_ok Current sample validity.
- */
-static void task_motor_publish_position(task_motor_context_t *context,
-                                        TickType_t now,
-                                        bool b_sample_ok)
-{
-    app_position_t position;
-
-    if (context->b_sensor_initialized)
+    p_motor->command_id = command.command_id;
+    if (APP_MOTOR_HOME == command.action)
     {
-        position.counts = HAL_AS5600_GetPosition();
+        p_motor->b_reference = false;
+        const bool b_release = Stepper_IsLimitActive();
+        p_motor->phase = b_release ? MOTOR_RELEASE : MOTOR_SEARCH;
+        if (!motor_start(p_motor, b_release ? APP_HOME_RELEASE_STEPS :
+                          APP_HOME_SEARCH_STEPS, b_release, true))
+        {
+            motor_fail(p_motor);
+        }
+        return;
     }
-    else
+    if ((APP_MOTOR_MOVE != command.action) || (!p_motor->b_reference) ||
+        ((0 != command.target_counts) &&
+         (APP_FLOOR_TWO_COUNTS != command.target_counts) &&
+         (APP_FLOOR_THREE_COUNTS != command.target_counts)))
     {
-        position.counts = 0;
+        motor_report(p_motor, APP_MOTOR_ERROR, command.command_id);
+        return;
     }
-
-    position.timestamp_ticks = now;
-
-    /*
-     * A valid sensor sample does not imply that the floor reference
-     * has been calibrated. HOME establishes the reference-valid state.
-     */
-    position.b_valid =
-        b_sample_ok &&
-        context->b_sample_valid &&
-        context->b_reference_valid;
-
-    if (pdPASS != xQueueOverwrite(context->position_queue, &position))
+    const int64_t delta = (int64_t)command.target_counts - p_motor->position;
+    if (0 == delta)
     {
-        context->b_sample_valid = false;
+        motor_report(p_motor, APP_MOTOR_ARRIVED, command.command_id);
+        return;
     }
-}
-
-/**
- * @brief Set MotorTask priority according to its activity.
- *
- * @param b_active true while verifying HOME or executing MOVE.
- */
-static void task_motor_set_priority(bool b_active)
-{
-    if (b_active)
+    /* Absolute delta of two int32_t values always fits uint64_t. */
+    const uint64_t distance = (uint64_t)((delta < 0) ? -delta : delta);
+    const uint64_t steps = ((distance * APP_MOTOR_STEPS_PER_ENCODER_REV) +
+        (HAL_AS5600_COUNTS_PER_REV - 1u)) / HAL_AS5600_COUNTS_PER_REV;
+    if ((0u == steps) || (UINT32_MAX < steps))
     {
-        vTaskPrioritySet(NULL, APP_MOTOR_PRIORITY_ACTIVE);
+        motor_report(p_motor, APP_MOTOR_ERROR, command.command_id);
+        return;
     }
-    else
+    p_motor->target = command.target_counts;
+    p_motor->phase = MOTOR_MOVE;
+    /* Range validated above before narrowing. */
+    if (!motor_start(p_motor, (uint32_t)steps, delta > 0, false))
     {
-        vTaskPrioritySet(NULL, APP_MOTOR_PRIORITY_IDLE);
+        motor_fail(p_motor);
     }
 }
 
-/**
- * @brief Save one terminal report for later queue delivery.
- *
- * @param context MotorTask runtime data.
- * @param result Terminal motor result.
- * @param command_id Related command identifier.
- */
-static void task_motor_record_report(task_motor_context_t *context,
-                                     app_motor_result_t result,
-                                     uint32_t command_id)
+/** @brief Release, approach and verify are independently bounded phases. */
+static void
+motor_home_update (motor_context_t * p_motor, TickType_t now)
 {
-    if (false == context->b_report_pending)
+    const bool b_limit = Stepper_IsLimitActive();
+    if (MOTOR_RELEASE == p_motor->phase)
     {
-        context->pending_report.result = result;
-        context->pending_report.command_id = command_id;
-
-        context->pending_report.position.counts = 0;
-        context->pending_report.position.timestamp_ticks =
-            xTaskGetTickCount();
-        context->pending_report.position.b_valid = false;
-
-        if (context->b_sensor_initialized)
-        {
-            context->pending_report.position.counts =
-                HAL_AS5600_GetPosition();
-            context->pending_report.position.b_valid =
-                context->b_sample_valid &&
-                context->b_reference_valid;
-        }
-
-        context->b_report_pending = true;
-    }
-}
-
-/**
- * @brief Send a pending terminal report when queue space is available.
- *
- * @param context MotorTask runtime data.
- */
-static void task_motor_flush_report(task_motor_context_t *context)
-{
-    if (context->b_report_pending)
-    {
-        if (pdPASS == xQueueSend(context->report_queue,
-                                 &context->pending_report,
-                                 0u))
-        {
-            context->b_report_pending = false;
-        }
-    }
-}
-
-/**
- * @brief Handle the first MotorTask iteration after Emergency is latched.
- *
- * Commands already queued before Emergency are discarded. The active
- * command receives a STOPPED report. The ISR has already switched off
- * the stepper outputs.
- *
- * @param context MotorTask runtime data.
- */
-static void task_motor_handle_emergency(task_motor_context_t *context)
-{
-    if (false == context->b_emergency_seen)
-    {
-        context->b_emergency_seen = true;
-
-        (void)xQueueReset(context->command_queue);
-
-        if (context->b_motion_active)
-        {
-            context->b_motion_active = false;
-            task_motor_set_priority(false);
-            task_motor_record_report(context,
-                                     APP_MOTOR_STOPPED,
-                                     context->motion_command_id);
-        }
-        else if (context->b_home_pending)
-        {
-            context->b_home_pending = false;
-            task_motor_set_priority(false);
-            task_motor_record_report(context,
-                                     APP_MOTOR_STOPPED,
-                                     context->home_command_id);
-        }
-        else
-        {
-            task_motor_set_priority(false);
-        }
-    }
-}
-
-/**
- * @brief Receive and dispatch one command.
- *
- * While Emergency is latched, only HOME is accepted. Any other command
- * is rejected and reported as STOPPED.
- *
- * @param context MotorTask runtime data.
- * @param now Current RTOS tick.
- * @param b_sample_ok Current encoder sample validity.
- */
-static void task_motor_receive_command(task_motor_context_t *context,
-                                       TickType_t now,
-                                       bool b_sample_ok)
-{
-    app_motor_command_t command;
-
-    if (pdPASS == xQueueReceive(context->command_queue, &command, 0u))
-    {
-        if (0u != Stepper_IsEmergencyLatched())
-        {
-            if (APP_MOTOR_HOME == command.action)
-            {
-                task_motor_start_home(context,
-                                      &command,
-                                      now,
-                                      b_sample_ok);
-            }
-            else
-            {
-                task_motor_record_report(context,
-                                         APP_MOTOR_STOPPED,
-                                         command.command_id);
-            }
-        }
-        else
-        {
-            task_motor_process_command(context,
-                                       &command,
-                                       now,
-                                       b_sample_ok);
-        }
-    }
-}
-
-/**
- * @brief Dispatch a motor command during normal operation.
- *
- * @param context MotorTask runtime data.
- * @param command Received command.
- * @param now Current RTOS tick.
- * @param b_sample_ok Current encoder sample validity.
- */
-static void task_motor_process_command(task_motor_context_t *context,
-                                       const app_motor_command_t *command,
-                                       TickType_t now,
-                                       bool b_sample_ok)
-{
-    if (APP_MOTOR_STOP == command->action)
-    {
-        if (context->b_motion_active)
+        if (!b_limit)
         {
             Stepper_Stop();
-            context->b_motion_active = false;
-            task_motor_set_priority(false);
-            task_motor_record_report(context,
-                                     APP_MOTOR_STOPPED,
-                                     context->motion_command_id);
+            p_motor->phase = MOTOR_RELEASE_SETTLE;
+            p_motor->settled = now;
         }
-        else
+        else if ((0u == Stepper_IsBusy()) ||
+                 motor_expired(now, p_motor->started,
+                               APP_HOME_RELEASE_TIMEOUT_MS))
         {
-            task_motor_record_report(context,
-                                     APP_MOTOR_STOPPED,
-                                     command->command_id);
+            motor_fail(p_motor);
         }
     }
-    else if (APP_MOTOR_MOVE == command->action)
+    else if (MOTOR_RELEASE_SETTLE == p_motor->phase)
     {
-        if (context->b_motion_active || context->b_home_pending)
+        if (b_limit)
         {
-            task_motor_record_report(context,
-                                     APP_MOTOR_ERROR,
-                                     command->command_id);
+            motor_fail(p_motor);
         }
-        else
+        else if ((TickType_t)(now - p_motor->settled) >=
+                 pdMS_TO_TICKS(APP_HOME_SETTLE_MS))
         {
-            task_motor_start_move(context,
-                                  command,
-                                  now,
-                                  b_sample_ok);
+            p_motor->phase = MOTOR_SEARCH;
+            if (!motor_start(p_motor, APP_HOME_SEARCH_STEPS, false, true))
+            {
+                motor_fail(p_motor);
+            }
         }
     }
-    else if (APP_MOTOR_HOME == command->action)
+    else if (MOTOR_SEARCH == p_motor->phase)
     {
-        /*
-         * HOME is deliberately rejected outside Emergency. This prevents
-         * an ordinary application command from changing the reference.
-         */
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 command->command_id);
+        if (b_limit)
+        {
+            Stepper_Stop();
+            p_motor->phase = MOTOR_VERIFY;
+            p_motor->started = now;
+            p_motor->settled = now;
+            p_motor->progress = p_motor->position;
+        }
+        else if ((0u == Stepper_IsBusy()) ||
+                 motor_expired(now, p_motor->started,
+                               APP_HOME_SEARCH_TIMEOUT_MS))
+        {
+            motor_fail(p_motor);
+        }
+    }
+    else if (MOTOR_VERIFY == p_motor->phase)
+    {
+        if ((!b_limit) || ((TickType_t)(now - p_motor->started) >=
+                          pdMS_TO_TICKS(APP_HOME_VERIFY_TIMEOUT_MS)))
+        {
+            motor_fail(p_motor);
+            return;
+        }
+        if (p_motor->position != p_motor->progress)
+        {
+            p_motor->progress = p_motor->position;
+            p_motor->settled = now;
+        }
+        if ((TickType_t)(now - p_motor->settled) >=
+            pdMS_TO_TICKS(APP_HOME_SETTLE_MS))
+        {
+            const TickType_t zero_start = xTaskGetTickCount();
+            if ((HAL_OK != HAL_AS5600_SetZero()) ||
+                ((TickType_t)(xTaskGetTickCount() - zero_start) >
+                 pdMS_TO_TICKS(APP_POSITION_MAX_GAP_MS)) ||
+                (!Stepper_IsLimitActive()) ||
+                (0u != Stepper_IsEmergencyLatched()))
+            {
+                motor_fail(p_motor);
+                return;
+            }
+            p_motor->position = 0;
+            p_motor->sample_time = xTaskGetTickCount();
+            p_motor->sample_start = zero_start;
+            p_motor->b_reference = true;
+            motor_finish(p_motor, APP_MOTOR_ARRIVED);
+        }
     }
     else
     {
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 command->command_id);
+        motor_fail(p_motor);
     }
 }
 
-/**
- * @brief Start a MOVE command when mechanical calibration is available.
- *
- * The target must be one of the three configured floor positions:
- * 0, 4096 or 8192 encoder counts relative to the confirmed floor-1 zero.
- *
- * @param context MotorTask runtime data.
- * @param command MOVE command.
- * @param now Current RTOS tick.
- * @param b_sample_ok Current encoder sample validity.
- */
-static void task_motor_start_move(task_motor_context_t *context,
-                                  const app_motor_command_t *command,
-                                  TickType_t now,
-                                  bool b_sample_ok)
+/** @brief Watch position, sensor health, deadline and progress. */
+static void
+motor_update (motor_context_t * p_motor)
 {
-    if ((false == context->b_sensor_initialized) ||
-        (false == context->b_magnet_detected) ||
-        (false == context->b_sample_valid) ||
-        (false == context->b_reference_valid) ||
-        (false == b_sample_ok))
+    if (MOTOR_IDLE == p_motor->phase)
     {
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 command->command_id);
         return;
     }
-
-    if (command->target_counts < 0)
+    const TickType_t now = xTaskGetTickCount();
+    if (!p_motor->b_sample)
     {
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 command->command_id);
+        motor_fail(p_motor);
         return;
     }
-
-    if (((uint32_t)command->target_counts >
-         ((APP_FLOOR_COUNT - 1u) * HAL_AS5600_COUNTS_PER_REV)) ||
-        (0 != (command->target_counts %
-               HAL_AS5600_COUNTS_PER_REV)))
+    if (p_motor->position != p_motor->progress)
     {
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 command->command_id);
-        return;
-    }
-
-#if (APP_MOTOR_MECHANICS_CALIBRATED == 1u)
-    {
-        int32_t current_counts;
-        int64_t delta_counts;
-        uint64_t distance_counts;
-        uint64_t steps_wide;
-        uint32_t steps;
-        Stepper_Direction_t direction;
-        HAL_StatusTypeDef status;
-
-        current_counts = HAL_AS5600_GetPosition();
-
-        delta_counts = (int64_t)command->target_counts -
-                       (int64_t)current_counts;
-
-        if (0 == delta_counts)
+        p_motor->progress_time = now;
+        if (MOTOR_VERIFY != p_motor->phase)
         {
-            task_motor_record_report(context,
-                                     APP_MOTOR_ARRIVED,
-                                     command->command_id);
+            p_motor->progress = p_motor->position;
+        }
+    }
+    if (0u != Stepper_IsBusy())
+    {
+        const bool b_up = (MOTOR_RELEASE == p_motor->phase) ||
+            ((MOTOR_MOVE == p_motor->phase) &&
+             (p_motor->target > p_motor->start));
+        const int64_t travel = (int64_t)p_motor->position - p_motor->start;
+        const int64_t tolerance = APP_MOTOR_ARRIVAL_TOLERANCE_COUNTS;
+        if ((b_up && (travel < -tolerance)) ||
+            ((!b_up) && (travel > tolerance)))
+        {
+            motor_fail(p_motor);
             return;
         }
-
-        if (delta_counts > 0)
-        {
-            distance_counts = (uint64_t)delta_counts;
-#if (APP_MOTOR_POSITIVE_DIR_CW == 1u)
-            direction = STEPPER_DIR_CW;
-#else
-            direction = STEPPER_DIR_CCW;
-#endif
-        }
-        else
-        {
-            distance_counts = (uint64_t)(-delta_counts);
-#if (APP_MOTOR_POSITIVE_DIR_CW == 1u)
-            direction = STEPPER_DIR_CCW;
-#else
-            direction = STEPPER_DIR_CW;
-#endif
-        }
-
-        steps_wide =
-            ((distance_counts *
-              (uint64_t)APP_MOTOR_STEPS_PER_ENCODER_REV) +
-             (HAL_AS5600_COUNTS_PER_REV / 2u)) /
-            HAL_AS5600_COUNTS_PER_REV;
-
-        if ((0u == steps_wide) || (steps_wide > UINT32_MAX))
-        {
-            task_motor_record_report(context,
-                                     APP_MOTOR_ERROR,
-                                     command->command_id);
-            return;
-        }
-
-        /* The preceding range check makes this conversion safe. */
-        steps = (uint32_t)steps_wide;
-
-        status = Stepper_Start(steps, direction);
-
-        if (HAL_OK != status)
-        {
-            task_motor_record_report(context,
-                                     APP_MOTOR_ERROR,
-                                     command->command_id);
-            return;
-        }
-
-        context->b_motion_active = true;
-        context->motion_command_id = command->command_id;
-        context->motion_start_counts = current_counts;
-        context->motion_target_counts = command->target_counts;
-        context->motion_start_ticks = now;
-
-        task_motor_set_priority(true);
     }
-#else
-    (void)now;
-
-    /*
-     * Do not guess the mechanical ratio or direction. MOVE remains
-     * disabled until the measured values are configured in app_cfg.h.
-     */
-    task_motor_record_report(context,
-                             APP_MOTOR_ERROR,
-                             command->command_id);
-#endif
-}
-
-/**
- * @brief Start stationary HOME verification during Emergency.
- *
- * ElevatorTask must send HOME only after the operator procedure and
- * mechanical reference-switch conditions have been verified. This
- * function never starts the stepper.
- *
- * @param context MotorTask runtime data.
- * @param command HOME command.
- * @param now Current RTOS tick.
- * @param b_sample_ok Current encoder sample validity.
- */
-static void task_motor_start_home(task_motor_context_t *context,
-                                  const app_motor_command_t *command,
-                                  TickType_t now,
-                                  bool b_sample_ok)
-{
-    if ((0u == Stepper_IsEmergencyLatched()) ||
-        (false == context->b_sensor_initialized) ||
-        (false == context->b_magnet_detected) ||
-        (false == b_sample_ok) ||
-        (0u != Stepper_IsBusy()))
+    if ((0u != Stepper_IsBusy()) &&
+        motor_expired(now, p_motor->progress_time,
+                      APP_MOTOR_STALL_TIMEOUT_MS))
     {
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 command->command_id);
+        motor_fail(p_motor);
         return;
     }
-
-    context->b_home_pending = true;
-    context->home_command_id = command->command_id;
-    context->home_stable_samples = 1u;
-    context->home_previous_counts = HAL_AS5600_GetPosition();
-    context->home_start_ticks = now;
-
-    task_motor_set_priority(true);
-}
-
-/**
- * @brief Check whether the encoder has reached or passed the target.
- *
- * @param context MotorTask runtime data.
- * @param current_counts Current encoder count.
- * @return true when target is reached or passed in the travel direction.
- */
-static bool task_motor_target_reached(const task_motor_context_t *context,
-                                      int32_t current_counts)
-{
-    int64_t target_counts;
-    int64_t current_position;
-    int64_t start_counts;
-
-    target_counts = (int64_t)context->motion_target_counts;
-    current_position = (int64_t)current_counts;
-    start_counts = (int64_t)context->motion_start_counts;
-
-    if (target_counts >= start_counts)
+    if (MOTOR_MOVE != p_motor->phase)
     {
-        return (current_position >= target_counts);
+        motor_home_update(p_motor, now);
+        return;
     }
-
-    return (current_position <= target_counts);
-}
-
-/**
- * @brief Monitor an active movement command.
- *
- * ARRIVED is reported only when the encoder confirms the target. Finishing
- * the programmed step count alone is not sufficient.
- *
- * @param context MotorTask runtime data.
- * @param now Current RTOS tick.
- * @param b_sample_ok Current encoder sample validity.
- */
-static void task_motor_update_move(task_motor_context_t *context,
-                                   TickType_t now,
-                                   bool b_sample_ok)
-{
-    int32_t current_counts;
-
-    current_counts = HAL_AS5600_GetPosition();
-
-    if ((false == b_sample_ok) ||
-        (false == context->b_sample_valid))
+    const int64_t error = (int64_t)p_motor->target - p_motor->position;
+    const bool b_arrived = (p_motor->target > p_motor->start) ?
+                           (error <= 0) : (error >= 0);
+    /* Magnitude of int32_t subtraction fits uint64_t. */
+    const uint64_t distance = (uint64_t)((error < 0) ? -error : error);
+    if (distance <= APP_MOTOR_ARRIVAL_TOLERANCE_COUNTS)
     {
-        Stepper_Stop();
-        context->b_motion_active = false;
-        task_motor_set_priority(false);
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 context->motion_command_id);
+        motor_finish(p_motor, APP_MOTOR_ARRIVED);
     }
-    else if (task_motor_target_reached(context, current_counts))
+    else if (b_arrived || (0u == Stepper_IsBusy()) ||
+             motor_expired(now, p_motor->started, APP_MOTOR_MOVE_TIMEOUT_MS))
     {
-        Stepper_Stop();
-        context->b_motion_active = false;
-        task_motor_set_priority(false);
-        task_motor_record_report(context,
-                                 APP_MOTOR_ARRIVED,
-                                 context->motion_command_id);
-    }
-    else if ((TickType_t)(now - context->motion_start_ticks) >=
-             pdMS_TO_TICKS(APP_MOTOR_MOVE_TIMEOUT_MS))
-    {
-        Stepper_Stop();
-        context->b_motion_active = false;
-        task_motor_set_priority(false);
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 context->motion_command_id);
-    }
-    else if (0u == Stepper_IsBusy())
-    {
-        context->b_motion_active = false;
-        task_motor_set_priority(false);
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 context->motion_command_id);
+        motor_fail(p_motor);
     }
 }
 
-/**
- * @brief Verify a stationary reference while Emergency remains latched.
- *
- * After the required number of stable samples, the encoder count is set
- * to zero. The mechanical switch validation is the responsibility of
- * ElevatorTask/operator procedure and must occur before HOME is sent.
- *
- * @param context MotorTask runtime data.
- * @param now Current RTOS tick.
- * @param b_sample_ok Current encoder sample validity.
- */
-static void task_motor_update_home(task_motor_context_t *context,
-                                   TickType_t now,
-                                   bool b_sample_ok)
+static void
+motor_task (void * p_argument)
 {
-    int32_t current_counts;
-    HAL_StatusTypeDef status;
-
-    if (0u == Stepper_IsEmergencyLatched())
+    (void)p_argument;
+    TickType_t wake = xTaskGetTickCount();
+    for (;;)
     {
-        context->b_home_pending = false;
-        task_motor_set_priority(false);
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 context->home_command_id);
-        return;
-    }
-
-    if ((TickType_t)(now - context->home_start_ticks) >=
-        pdMS_TO_TICKS(APP_MOTOR_HOME_TIMEOUT_MS))
-    {
-        context->b_home_pending = false;
-        context->b_sample_valid = false;
-        context->b_reference_valid = false;
-        task_motor_set_priority(false);
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 context->home_command_id);
-        return;
-    }
-
-    if ((false == b_sample_ok) ||
-        (false == context->b_magnet_detected))
-    {
-        context->b_home_pending = false;
-        context->b_sample_valid = false;
-        context->b_reference_valid = false;
-        task_motor_set_priority(false);
-        task_motor_record_report(context,
-                                 APP_MOTOR_ERROR,
-                                 context->home_command_id);
-        return;
-    }
-
-    current_counts = HAL_AS5600_GetPosition();
-
-    if (current_counts == context->home_previous_counts)
-    {
-        context->home_stable_samples++;
-    }
-    else
-    {
-        context->home_stable_samples = 1u;
-    }
-
-    context->home_previous_counts = current_counts;
-
-    if (context->home_stable_samples >=
-        APP_MOTOR_HOME_STABLE_SAMPLES)
-    {
-        status = HAL_AS5600_SetZero();
-
-        context->b_home_pending = false;
-        task_motor_set_priority(false);
-
-        if (HAL_OK == status)
+        const uint32_t generation = Stepper_EmergencyGeneration();
+        if ((generation != g_motor.generation) ||
+            (0u != Stepper_IsEmergencyLatched()))
         {
-            context->b_sample_valid = true;
-            context->b_reference_valid = true;
-            context->b_have_sample = true;
-            context->last_sample_ticks = now;
-
-            task_motor_record_report(context,
-                                     APP_MOTOR_ARRIVED,
-                                     context->home_command_id);
+            if (generation != g_motor.generation)
+            {
+                (void)xQueueReset(gh_commands);
+            }
+            g_motor.generation = generation;
+            g_motor.b_reference = false;
+            if (MOTOR_IDLE != g_motor.phase)
+            {
+                motor_finish(&g_motor, APP_MOTOR_STOPPED);
+            }
         }
-        else
+        motor_sample(&g_motor);
+        if (0u == Stepper_IsEmergencyLatched())
         {
-            context->b_sample_valid = false;
-            task_motor_record_report(context,
-                                     APP_MOTOR_ERROR,
-                                     context->home_command_id);
+            motor_update(&g_motor);
         }
+        if ((0u != g_motor.report_count) &&
+            (pdPASS == xQueueSend(gh_reports, &g_motor.reports[0], 0u)))
+        {
+            g_motor.report_count--;
+            g_motor.reports[0] = g_motor.reports[1];
+        }
+        if (0u == Stepper_IsEmergencyLatched())
+        {
+            motor_command(&g_motor);
+        }
+        const bool b_up = (MOTOR_RELEASE == g_motor.phase) ||
+            ((MOTOR_MOVE == g_motor.phase) &&
+             (g_motor.target > g_motor.start));
+        const app_position_t sample = {
+            .direction = (0u == Stepper_IsBusy()) ? APP_DIRECTION_STOPPED :
+                (b_up ? APP_DIRECTION_UP : APP_DIRECTION_DOWN),
+            .counts = g_motor.position,
+            .timestamp_ticks = g_motor.sample_time,
+            .b_valid = g_motor.b_sample && g_motor.b_reference,
+            .b_sensor_valid = g_motor.b_sample
+        };
+        configASSERT(pdPASS == xQueueOverwrite(gh_position, &sample));
+        /* Slow bus operations must not cause rapid catch-up sampling. */
+        wake = xTaskGetTickCount();
+        vTaskDelayUntil(&wake, pdMS_TO_TICKS(APP_POSITION_PERIOD_MS));
     }
 }
 

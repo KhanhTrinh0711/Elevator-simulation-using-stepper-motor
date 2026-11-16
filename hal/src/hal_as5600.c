@@ -4,6 +4,7 @@
  */
 #include "hal_as5600.h"
 #include "bsp_i2c.h"
+#include <limits.h>
 
 /* Encoder software state. */
 static uint16_t previous_angle = 0U;
@@ -133,7 +134,14 @@ HAL_AS5600_UpdatePosition(void)
         /* No wrap-around. */
     }
 
-    accumulated_position += delta;
+    const int64_t next = (int64_t)accumulated_position + delta;
+    if ((next < INT32_MIN) || (next > INT32_MAX))
+    {
+        initialized = 0U;
+        return HAL_ERROR;
+    }
+    /* Range checked before narrowing to the application's count type. */
+    accumulated_position = (int32_t)next;
     previous_angle = current_angle;
 
     return HAL_OK;

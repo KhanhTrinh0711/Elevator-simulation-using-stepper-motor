@@ -38,6 +38,9 @@ static volatile uint8_t limit_event_pending = 0u;
 
 static volatile uint32_t remaining_steps = 0u;
 static volatile uint16_t timer_count = 0u;
+static volatile uint16_t step_interval = STEPPER_STEP_INTERVAL;
+static volatile bool stop_on_limit = false;
+static volatile uint32_t emergency_generation = 0u;
 
 /**
  * @brief Apply one half-step phase to the motor outputs.
@@ -68,7 +71,11 @@ Stepper_Init (void)
     step_index = 0u;
     step_busy = 0u;
     direction = STEPPER_DIR_CW;
-    emergency_latched = 0u;
+    /* Never erase an earlier ISR latch or a held startup button. */
+    if (GPIO_PIN_RESET == HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0))
+    {
+        emergency_latched = 1u;
+    }
     limit_event_pending = 0u;
     remaining_steps = 0u;
     timer_count = 0u;
@@ -86,10 +93,18 @@ Stepper_Init (void)
 HAL_StatusTypeDef
 Stepper_Start (uint32_t steps, Stepper_Direction_t dir)
 {
+    return Stepper_StartMotion(steps, dir, STEPPER_STEP_INTERVAL, true);
+}
+
+/** @brief Start only while the physical Emergency input is released. */
+HAL_StatusTypeDef
+Stepper_StartMotion (uint32_t steps, Stepper_Direction_t dir,
+                     uint16_t interval_ms, bool stop_at_limit)
+{
     uint32_t primask = __get_PRIMASK();
     HAL_StatusTypeDef result = HAL_OK;
 
-    if ((0u == steps) ||
+    if ((0u == steps) || (0u == interval_ms) ||
         ((STEPPER_DIR_CW != dir) &&
          (STEPPER_DIR_CCW != dir)))
     {
@@ -98,8 +113,11 @@ Stepper_Start (uint32_t steps, Stepper_Direction_t dir)
 
     __disable_irq();
 
-    if (0u != emergency_latched)
+    if ((0u != emergency_latched) ||
+        (GPIO_PIN_RESET == HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0)) ||
+        (0u != (EXTI->PR & GPIO_PIN_0)))
     {
+        emergency_latched = 1u;
         result = HAL_BUSY;
     }
     else if (0u != step_busy)
@@ -108,6 +126,14 @@ Stepper_Start (uint32_t steps, Stepper_Direction_t dir)
     }
     else
     {
+        if (stop_at_limit && Stepper_IsLimitActive())
+        {
+            __set_PRIMASK(primask);
+            return HAL_ERROR;
+        }
+        step_interval = interval_ms;
+        stop_on_limit = stop_at_limit;
+        limit_event_pending = 0u;
         direction = (uint8_t)dir;
         remaining_steps = steps;
         timer_count = 0u;
@@ -150,6 +176,7 @@ Stepper_EmergencyStop (void)
     __disable_irq();
 
     emergency_latched = 1u;
+    emergency_generation++;
     step_busy = 0u;
     remaining_steps = 0u;
     timer_count = 0u;
@@ -167,6 +194,12 @@ Stepper_EmergencyStop (void)
 HAL_StatusTypeDef
 Stepper_EmergencyRecover (void)
 {
+    return Stepper_RecoverGeneration(emergency_generation);
+}
+
+HAL_StatusTypeDef
+Stepper_RecoverGeneration (uint32_t generation)
+{
     uint32_t primask;
     HAL_StatusTypeDef result = HAL_OK;
 
@@ -178,7 +211,9 @@ Stepper_EmergencyRecover (void)
     primask = __get_PRIMASK();
     __disable_irq();
 
-    if (GPIO_PIN_RESET == HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0))
+    if ((GPIO_PIN_RESET == HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0)) ||
+        (generation != emergency_generation) ||
+        (0u != (EXTI->PR & GPIO_PIN_0)))
     {
         result = HAL_BUSY;
     }
@@ -190,6 +225,18 @@ Stepper_EmergencyRecover (void)
     __set_PRIMASK(primask);
 
     return result;
+}
+
+uint32_t
+Stepper_EmergencyGeneration (void)
+{
+    return emergency_generation;
+}
+
+bool
+Stepper_IsLimitActive (void)
+{
+    return (GPIO_PIN_RESET == HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_1));
 }
 
 /**
@@ -238,15 +285,25 @@ Stepper_ClearLimitEvent (void)
 void
 Stepper_OnTimerElapsed (void)
 {
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (stop_on_limit && Stepper_IsLimitActive())
+    {
+        step_busy = 0u;
+        remaining_steps = 0u;
+        limit_event_pending = 1u;
+    }
     if ((0u != emergency_latched) || (0u == step_busy))
     {
+        __set_PRIMASK(primask);
         return;
     }
 
     timer_count++;
 
-    if (timer_count < STEPPER_STEP_INTERVAL)
+    if (timer_count < step_interval)
     {
+        __set_PRIMASK(primask);
         return;
     }
 
@@ -281,6 +338,7 @@ Stepper_OnTimerElapsed (void)
     {
         step_busy = 0u;
     }
+    __set_PRIMASK(primask);
 }
 
 /**
@@ -307,6 +365,10 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     else if (GPIO_PIN_1 == GPIO_Pin)
     {
         limit_event_pending = 1u;
+        if (stop_on_limit)
+        {
+            Stepper_Stop();
+        }
     }
     else
     {

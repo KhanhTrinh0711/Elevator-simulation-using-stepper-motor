@@ -74,17 +74,28 @@ typedef struct
     bool     b_admission_open;
 } app_input_context_t;
 
+/** @brief Display direction; no raw motor phase state is exposed. */
+typedef enum
+{
+    APP_DIRECTION_STOPPED = 0,
+    APP_DIRECTION_UP,
+    APP_DIRECTION_DOWN
+} app_direction_t;
+
 /** @brief Counts relative to the calibrated floor-1 reference.
  *
- * Nominal floor targets are 0, 4096 and 8192 counts. A sample without
+ * Floor targets come from measured APP_FLOOR_*_COUNTS. A sample without
  * a valid calibrated reference must set b_valid to false, including
  * after lost turns.
  */
 typedef struct
 {
     int32_t    counts;
+    app_direction_t direction;
     TickType_t timestamp_ticks;
     bool       b_valid;
+    /* Sensor health without an absolute reference, for bounded HOMING. */
+    bool       b_sensor_valid;
 } app_position_t;
 
 /** @brief Ordinary motor commands; emergency uses a separate hard-stop path. */
@@ -130,13 +141,15 @@ typedef enum
     APP_STATE_EMERGENCY
 } app_state_t;
 
-/** @brief Display direction; no raw motor phase state is exposed. */
+/** @brief Persistent runtime errors require repair and reset. */
 typedef enum
 {
-    APP_DIRECTION_STOPPED = 0,
-    APP_DIRECTION_UP,
-    APP_DIRECTION_DOWN
-} app_direction_t;
+    APP_ERROR_NONE = 0,
+    APP_ERROR_CONFIG,
+    APP_ERROR_SENSOR,
+    APP_ERROR_MOTOR,
+    APP_ERROR_IPC
+} app_error_t;
 
 /** @brief Display snapshot published by ElevatorTask.
  *
@@ -151,6 +164,7 @@ typedef struct
 {
     TickType_t      timestamp_ticks;
     app_state_t     state;
+    app_error_t     error;
     app_direction_t direction;
     uint32_t        auth_remaining_ms;
     uint8_t         current_floor;

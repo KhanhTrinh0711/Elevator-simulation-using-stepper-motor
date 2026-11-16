@@ -160,7 +160,8 @@ hal_rc522_read_uid (hal_rc522_uid_t * p_uid)
 
         if (HAL_RC522_OK != status)
         {
-            return status;
+            /* A card answered WUPA: selection silence is not removal. */
+            return (HAL_RC522_NO_CARD == status) ? HAL_RC522_TIMEOUT : status;
         }
     }
 

@@ -3,6 +3,9 @@
  */
 #include "bsp_i2c.h"
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
 #include "FreeRTOS.h"
 #include "semphr.h"
 #include "task.h"

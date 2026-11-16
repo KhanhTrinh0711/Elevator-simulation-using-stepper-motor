@@ -144,7 +144,8 @@ display_valid (const app_display_snapshot_t * p_snapshot)
 static bool
 display_ready (const app_display_snapshot_t * p_snapshot)
 {
-    return (p_snapshot->b_ready && (APP_STATE_IDLE == p_snapshot->state) &&
+    return (p_snapshot->b_ready && (APP_ERROR_NONE == p_snapshot->error) &&
+        (APP_STATE_IDLE == p_snapshot->state) &&
         (APP_DIRECTION_STOPPED == p_snapshot->direction) &&
         (0u != p_snapshot->current_floor) &&
         (0u == p_snapshot->waiting_count));
@@ -213,15 +214,40 @@ display_draw (const app_display_snapshot_t * p_snapshot,
             auth[8] = (char)('0' + (tenths % 10u));
         }
     }
+    const char * p_error = "ERROR: NONE";
+    if (b_fresh)
+    {
+        switch (p_snapshot->error)
+        {
+            case APP_ERROR_NONE:
+                break;
+            case APP_ERROR_CONFIG:
+                p_error = "ERROR: CONFIG";
+                break;
+            case APP_ERROR_SENSOR:
+                p_error = "ERROR: SENSOR";
+                break;
+            case APP_ERROR_MOTOR:
+                p_error = "ERROR: MOTOR";
+                break;
+            case APP_ERROR_IPC:
+                p_error = "ERROR: IPC";
+                break;
+            default:
+                p_error = "ERROR: ?";
+                break;
+        }
+    }
     const char * const lines[] =
     {
         b_fresh ? display_state(p_snapshot->state) : "STATE: NO DATA",
         floor, p_direction, waiting, auth,
-        (b_fresh && display_ready(p_snapshot)) ? "READY: YES" : "READY: NO"
+        (b_fresh && display_ready(p_snapshot)) ? "READY: YES" : "READY: NO",
+        b_fresh ? p_error : "ERROR: ?"
     };
     for (uint32_t row = 0u; row < (sizeof(lines) / sizeof(lines[0])); row++)
     {
-        /* Six rows fit the OLED's 8-bit page argument. */
+        /* Seven rows fit the OLED's 8-bit page argument. */
         const HAL_StatusTypeDef status = hal_oled_write_line(
             (uint8_t)row, lines[row]);
         if (HAL_OK != status)

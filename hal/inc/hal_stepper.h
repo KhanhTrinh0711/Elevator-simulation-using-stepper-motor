@@ -7,6 +7,7 @@
 #define HAL_STEPPER_H
 
 #include "stm32f1xx_hal.h"
+#include <stdbool.h>
 
 typedef enum
 {
@@ -25,6 +26,19 @@ void Stepper_Init(void);
  */
 HAL_StatusTypeDef Stepper_Start(uint32_t steps,
                                 Stepper_Direction_t direction);
+
+/** @brief Start bounded motion; timer interval is 1..65535 ms.
+ * stop_at_limit stops on the active-low floor-1 switch before any next phase.
+ * Only upward homing release/motion may deliberately ignore that switch.
+ */
+HAL_StatusTypeDef Stepper_StartMotion(uint32_t steps,
+    Stepper_Direction_t direction, uint16_t interval_ms, bool stop_at_limit);
+/** @brief Emergency generation changes on each new stop request. */
+uint32_t Stepper_EmergencyGeneration(void);
+/** @brief Recover only the observed generation, with released PA0. */
+HAL_StatusTypeDef Stepper_RecoverGeneration(uint32_t generation);
+/** @brief Read the actual switch level, including at startup. */
+bool Stepper_IsLimitActive(void);
 
 /** @brief Stop the motor while retaining the current phase. */
 void Stepper_Stop(void);

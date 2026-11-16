@@ -49,7 +49,7 @@ BSP_GPIO_Init (void)
     HAL_GPIO_Init(GPIOA, &pins);
 
     /* Enable EXTI interrupts for PA0 and PA1. */
-    HAL_NVIC_SetPriority(EXTI0_IRQn, 6, 0);
+    HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
     HAL_NVIC_SetPriority(EXTI1_IRQn, 6, 0);

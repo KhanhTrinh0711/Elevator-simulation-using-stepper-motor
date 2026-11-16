@@ -5,7 +5,7 @@ Tên tài liệu được giữ để các liên kết cũ vẫn dùng được.
 
 ## Hiển thị và quyền sở hữu
 
-OLED SSD1306 128×64, địa chỉ I²C 7-bit 0x3C, hiển thị sáu dòng chữ ASCII:
+OLED SSD1306 128×64, địa chỉ I²C 7-bit 0x3C, hiển thị bảy dòng chữ ASCII:
 
 ```text
 STATE: IDLE
@@ -14,6 +14,7 @@ DIR: STOPPED
 QUEUE: 0
 RFID: 2.7 S
 READY: YES
+ERROR: NONE
 ```
 
 - Hỗ trợ INIT/HOMING/IDLE/MOVING/ARRIVED/EMERGENCY.
@@ -113,9 +114,9 @@ Kiểm tra host bằng mock tạm ngoài repo: mặc định NO DATA, nhận sna
 snapshot sai, retry init; driver kiểm tra giới hạn hàng/chuỗi, ký tự thay thế,
 xóa đuôi chữ và trả lỗi tại từng giao dịch.
 
-Build firmware mặc định vẫn chạy PC13 blink, không gọi DisplayTask. Kiểm tra
+Firmware tích hợp hiện gọi DisplayTask và ElevatorTask phát snapshot. Kiểm tra
 link giữ API display giúp phát hiện lỗi liên kết mà linker GC có thể che đi;
-không thay thế nạp kit. main.c sản xuất chỉ ghép ở nhánh integration theo plan.
+không thay thế nạp kit. main.c đã ghép ở integration/system-v1; mặc định ERROR: CONFIG khi chưa đo cơ khí.
 
 Cần đo trên kit: hướng OLED, chữ đọc được, LED active-high, độ trễ nháy khi
 OLED mất kết nối, jitter encoder khi chung bus, stack high-water mark.

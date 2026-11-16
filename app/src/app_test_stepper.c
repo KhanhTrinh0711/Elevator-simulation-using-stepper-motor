@@ -41,6 +41,8 @@ static void Task_Test_Stepper(void *argument)
 
             vTaskDelay(pdMS_TO_TICKS(STEPPER_PAUSE_MS));
         }
+        /* Failed starts must yield, especially while Emergency is latched. */
+        vTaskDelay(pdMS_TO_TICKS(10u));
     }
 }
 

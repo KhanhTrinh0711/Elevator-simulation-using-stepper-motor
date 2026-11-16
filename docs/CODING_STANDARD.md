@@ -96,3 +96,10 @@ module_run (void)
 
 /*** end of file ***/
 ```
+
+## Cập nhật tích hợp 2026-11-16
+
+Phần mô tả đợt review phía trên là lịch sử, không phải trạng thái hiện tại:
+main.c đã khởi chạy RTOS, EXTI0/1 và năm task đã ghép. Hàm `_init` trong
+bsp_runtime.c là ngoại lệ tên do Newlib yêu cầu khi dùng startup ST với
+-nostartfiles. Fatal hooks đi qua bsp_fault_stop để tắt motor trước khi halt.
