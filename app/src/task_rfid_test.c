@@ -1,68 +1,187 @@
 /** @file task_rfid_test.c
- * @brief Poll a single RFID card and publish test results without a queue.
+ * @brief Card presentation filtering for ordered input events.
  */
 #include "task_rfid_test.h"
-#include <stdbool.h>
 #include "app_cfg.h"
-#include "bsp_gpio.h"
+#include "app_ipc.h"
 #include "task.h"
+#include "stm32f1xx.h"
 
 _Static_assert(APP_INPUT_PRIORITY < configMAX_PRIORITIES,
-               "RFID test priority exceeds the RTOS range");
+               "RFID priority exceeds the RTOS range");
 _Static_assert(0u < pdMS_TO_TICKS(APP_RFID_PERIOD_MS),
-               "RFID polling must yield for at least one tick");
+               "RFID polling must yield");
 
-static TaskHandle_t        gp_rfid_task = NULL;
-/* Accessed only inside critical sections; volatile is not synchronization. */
+static TaskHandle_t gp_rfid_task = NULL;
+static TaskHandle_t gp_owner = NULL;
+static QueueHandle_t gh_input = NULL;
+static bool gb_configured = false;
+static bool gb_ready = false;
+static bool gb_armed = true;
+static uint8_t g_absent_polls = 0u;
+static TickType_t g_last_poll = 0u;
+static TickType_t g_wait_ticks = 0u;
+/* Shared copies are protected by critical sections, not volatile. */
+static task_rfid_context_t g_context = {0};
 static task_rfid_snapshot_t g_snapshot = {.status = HAL_RC522_NOT_READY};
 
 static bool rfid_context_valid (void);
+static bool rfid_uid_valid (const hal_rc522_uid_t * p_uid);
 static void rfid_test_task (void * p_argument);
-static void rfid_publish (const task_rfid_snapshot_t * p_snapshot);
+static void rfid_present (task_rfid_snapshot_t * p_snapshot,
+                          const task_rfid_context_t * p_context);
 
-/** @brief Prepare only the test LEDs and create the polling task. */
+/** @brief Bind the input queue without creating another IPC channel. */
 BaseType_t
-task_rfid_test_create (void)
+task_rfid_configure (void)
 {
-    if ((!rfid_context_valid()) || (NULL != gp_rfid_task) ||
+    if ((!rfid_context_valid()) || gb_configured ||
         (taskSCHEDULER_NOT_STARTED != xTaskGetSchedulerState()))
     {
         return pdFAIL;
     }
-
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    HAL_GPIO_WritePin(GPIOB, LED_GREEN_PIN | LED_RED_PIN, GPIO_PIN_RESET);
-    GPIO_InitTypeDef pins = {0};
-
-    pins.Pin   = LED_GREEN_PIN | LED_RED_PIN;
-    pins.Mode  = GPIO_MODE_OUTPUT_PP;
-    pins.Pull  = GPIO_NOPULL;
-    pins.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOB, &pins);
-
-    return xTaskCreate(rfid_test_task, "RfidTest", APP_INPUT_STACK_WORDS,
-                       NULL, APP_INPUT_PRIORITY, &gp_rfid_task);
+    gh_input = app_ipc_queue(APP_QUEUE_INPUT);
+    if (NULL == gh_input)
+    {
+        return pdFAIL;
+    }
+    g_last_poll = xTaskGetTickCount();
+    g_wait_ticks = pdMS_TO_TICKS(TASK_RFID_POWER_WAIT_MS);
+    gb_configured = true;
+    return pdPASS;
 }
 
-/** @brief Return a coherent result, even when a higher-priority reader runs. */
+/** @brief Admission changes never authorize a card already being held. */
 BaseType_t
-task_rfid_test_snapshot (task_rfid_snapshot_t * p_snapshot)
+task_rfid_set_context (const task_rfid_context_t * p_context)
 {
-    if ((NULL == p_snapshot) || (!rfid_context_valid()) ||
-        (NULL == gp_rfid_task) ||
+    if ((NULL == p_context) || (!rfid_context_valid()) ||
+        (!gb_configured) ||
         (taskSCHEDULER_RUNNING != xTaskGetSchedulerState()))
     {
         return pdFAIL;
     }
-
     taskENTER_CRITICAL();
-    *p_snapshot = g_snapshot;
+    g_context = *p_context;
     taskEXIT_CRITICAL();
-
     return pdPASS;
 }
 
-/** @brief Disallow ISR and masked-interrupt calls to task APIs. */
+/** @brief Standalone adapter, mutually exclusive with InputTask polling. */
+BaseType_t
+task_rfid_test_create (void)
+{
+    if ((!rfid_context_valid()) || (!gb_configured) ||
+        (NULL != gp_rfid_task) ||
+        (taskSCHEDULER_NOT_STARTED != xTaskGetSchedulerState()))
+    {
+        return pdFAIL;
+    }
+    return xTaskCreate(rfid_test_task, "RfidInput", APP_INPUT_STACK_WORDS,
+                       NULL, APP_INPUT_PRIORITY, &gp_rfid_task);
+}
+
+/** @brief Bound retry cadence and consume each presentation only once. */
+BaseType_t
+task_rfid_poll (void)
+{
+    if ((!rfid_context_valid()) || (!gb_configured) ||
+        (taskSCHEDULER_RUNNING != xTaskGetSchedulerState()))
+    {
+        return pdFAIL;
+    }
+    const TaskHandle_t p_caller = xTaskGetCurrentTaskHandle();
+    taskENTER_CRITICAL();
+    if ((NULL == gp_owner) &&
+        ((NULL == gp_rfid_task) || (p_caller == gp_rfid_task)))
+    {
+        gp_owner = p_caller;
+    }
+    const bool b_owner = (p_caller == gp_owner);
+    const task_rfid_context_t context = g_context;
+    task_rfid_snapshot_t snapshot = g_snapshot;
+    taskEXIT_CRITICAL();
+    if (!b_owner)
+    {
+        return pdFAIL;
+    }
+
+    const TickType_t now = xTaskGetTickCount();
+    /* Unsigned tick subtraction intentionally supports a tick rollover. */
+    if ((TickType_t)(now - g_last_poll) < g_wait_ticks)
+    {
+        return pdPASS;
+    }
+    const hal_rc522_uid_t empty_uid = {0};
+    snapshot.uid = empty_uid;
+    if (!gb_ready)
+    {
+        snapshot.status = hal_rc522_init(&snapshot.version);
+        gb_ready = (HAL_RC522_OK == snapshot.status);
+    }
+    if (gb_ready)
+    {
+        snapshot.status = hal_rc522_read_uid(&snapshot.uid);
+    }
+    if ((HAL_RC522_OK == snapshot.status) &&
+        (!rfid_uid_valid(&snapshot.uid)))
+    {
+        snapshot.status = HAL_RC522_PROTOCOL_ERROR;
+        snapshot.uid = empty_uid;
+    }
+    snapshot.timestamp_ticks = xTaskGetTickCount();
+    g_wait_ticks = pdMS_TO_TICKS(APP_RFID_PERIOD_MS);
+    if (HAL_RC522_OK == snapshot.status)
+    {
+        g_absent_polls = 0u;
+        snapshot.successful_reads++;
+        if (gb_armed)
+        {
+            gb_armed = false;
+            rfid_present(&snapshot, &context);
+        }
+    }
+    else if (HAL_RC522_NO_CARD == snapshot.status)
+    {
+        if (TASK_RFID_RELEASE_POLLS > g_absent_polls)
+        {
+            g_absent_polls++;
+        }
+        if (TASK_RFID_RELEASE_POLLS == g_absent_polls)
+        {
+            gb_armed = true;
+        }
+    }
+    else
+    {
+        g_absent_polls = 0u;
+        gb_ready = false;
+        g_wait_ticks = pdMS_TO_TICKS(TASK_RFID_RETRY_MS);
+    }
+    g_last_poll = snapshot.timestamp_ticks;
+    taskENTER_CRITICAL();
+    g_snapshot = snapshot;
+    taskEXIT_CRITICAL();
+    return pdPASS;
+}
+
+/** @brief Copy diagnostics without exposing mutable shared state. */
+BaseType_t
+task_rfid_test_snapshot (task_rfid_snapshot_t * p_snapshot)
+{
+    if ((NULL == p_snapshot) || (!rfid_context_valid()) ||
+        (!gb_configured) ||
+        (taskSCHEDULER_RUNNING != xTaskGetSchedulerState()))
+    {
+        return pdFAIL;
+    }
+    taskENTER_CRITICAL();
+    *p_snapshot = g_snapshot;
+    taskEXIT_CRITICAL();
+    return pdPASS;
+}
+
+/** @brief Reject calls which could deadlock RTOS or SPI waiting. */
 static bool
 rfid_context_valid (void)
 {
@@ -70,71 +189,57 @@ rfid_context_valid (void)
             (0u == __get_BASEPRI()));
 }
 
-/** @brief Reset on faults; normal absence of a card simply resumes polling. */
+/** @brief Only complete ISO14443A UIDs are identity keys. */
+static bool
+rfid_uid_valid (const hal_rc522_uid_t * p_uid)
+{
+    return ((4u == p_uid->length) || (7u == p_uid->length) ||
+            (10u == p_uid->length));
+}
+
+/** @brief Never defer an event until after a lock or a full queue clears. */
+static void
+rfid_present (task_rfid_snapshot_t * p_snapshot,
+               const task_rfid_context_t * p_context)
+{
+    app_input_event_t event = {0};
+    event.kind = APP_INPUT_AUTH;
+    event.timestamp_ticks = p_snapshot->timestamp_ticks;
+    event.authorization_epoch = p_context->authorization_epoch;
+    event.admission_epoch = p_context->admission_epoch;
+    /* shortcut: accept any UID, add an allowlist when access rules are set. */
+    event.b_authorized = true;
+    p_snapshot->presentations++;
+
+    /* Compare and enqueue atomically against task-level admission updates.
+     * Elevator must additionally reject a latched hardware Emergency.
+     */
+    taskENTER_CRITICAL();
+    const bool b_current = (p_context->b_enabled && g_context.b_enabled &&
+        (p_context->admission_epoch == g_context.admission_epoch) &&
+        (p_context->authorization_epoch == g_context.authorization_epoch));
+    if (b_current && (pdPASS == xQueueSend(gh_input, &event, 0u)))
+    {
+        p_snapshot->sent_events++;
+    }
+    else
+    {
+        p_snapshot->dropped_events++;
+    }
+    taskEXIT_CRITICAL();
+}
+
+/** @brief Adapter only; production InputTask calls the same poll function. */
 static void
 rfid_test_task (void * p_argument)
 {
-    /* Required RTOS signature; this task has no argument to consume. */
+    /* Required RTOS entry signature; no caller-owned argument is retained. */
     (void)p_argument;
-
-    bool b_ready = false;
-    task_rfid_snapshot_t snapshot = {.status = HAL_RC522_NOT_READY};
-
-    vTaskDelay(pdMS_TO_TICKS(TASK_RFID_POWER_WAIT_MS));
-
     for (;;)
     {
-        const hal_rc522_uid_t empty_uid = {0};
-        snapshot.uid = empty_uid;
-
-        if (!b_ready)
-        {
-            snapshot.status = hal_rc522_init(&snapshot.version);
-            b_ready = (HAL_RC522_OK == snapshot.status);
-        }
-
-        if (b_ready)
-        {
-            snapshot.status = hal_rc522_read_uid(&snapshot.uid);
-        }
-
-        if (HAL_RC522_OK == snapshot.status)
-        {
-            snapshot.successful_reads++;
-        }
-
-        snapshot.timestamp_ticks = xTaskGetTickCount();
-        rfid_publish(&snapshot);
-
-        if ((HAL_RC522_OK != snapshot.status) &&
-            (HAL_RC522_NO_CARD != snapshot.status))
-        {
-            b_ready = false;
-            vTaskDelay(pdMS_TO_TICKS(TASK_RFID_RETRY_MS));
-        }
-        else
-        {
-            vTaskDelay(pdMS_TO_TICKS(APP_RFID_PERIOD_MS));
-        }
+        configASSERT(pdPASS == task_rfid_poll());
+        vTaskDelay(pdMS_TO_TICKS(APP_INPUT_PERIOD_MS));
     }
-}
-
-/** @brief Publish before reflecting status on the two test-owned LEDs. */
-static void
-rfid_publish (const task_rfid_snapshot_t * p_snapshot)
-{
-    taskENTER_CRITICAL();
-    g_snapshot = *p_snapshot;
-    taskEXIT_CRITICAL();
-
-    const bool b_card = (HAL_RC522_OK == p_snapshot->status);
-    const bool b_error = ((!b_card) &&
-                         (HAL_RC522_NO_CARD != p_snapshot->status));
-
-    HAL_GPIO_WritePin(GPIOB, LED_GREEN_PIN,
-                      b_card ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, LED_RED_PIN,
-                      b_error ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
 /*** end of file ***/

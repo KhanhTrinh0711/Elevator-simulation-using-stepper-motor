@@ -7,9 +7,11 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+
+#include "app_cfg.h"
 #include "FreeRTOS.h"
 #include "queue.h"
-#include "app_cfg.h"
+
 /** @brief Queue identifiers; use app_ipc_queue after successful init. */
 typedef enum
 {
@@ -30,9 +32,22 @@ typedef enum
     APP_INPUT_CALIBRATE
 } app_input_kind_t;
 
-/** @brief Input events ordered by InputTask, interpreted by ElevatorTask.
- * AUTH carries a valid UID and b_authorized=true. This flag means the UID
- * was read successfully; it does not mean ElevatorTask granted access.
+/** @brief Input events sent by InputTask and interpreted by ElevatorTask.
+ *
+ * AUTH carries a successfully read UID and b_authorized=true.
+ * This flag indicates successful UID reading, not that ElevatorTask
+ * has granted access. RFID currently accepts any successfully read UID;
+ * whitelist policy is owned by ElevatorTask when configured by the leader.
+ *
+ * timestamp_ticks uses the RTOS tick clock, not HAL milliseconds.
+ * ElevatorTask grants APP_AUTH_WINDOW_MS from the AUTH event timestamp,
+ * never from queue receive time. Expired AUTH events must be rejected.
+ *
+ * ElevatorTask must reject AUTH/FLOOR while hardware emergency is latched
+ * or admission is closed. ElevatorTask owns authorization_epoch and
+ * admission_epoch. InputTask copies these epochs from the latest published
+ * context. Stale events must be rejected after session or admission changes.
+ *
  * FLOOR carries floor (1..3). Unused fields must be zero-initialized.
  */
 typedef struct
@@ -48,7 +63,9 @@ typedef struct
 } app_input_event_t;
 
 /** @brief Input admission/session snapshot owned by ElevatorTask.
- * Input producers use this snapshot to tag events with current epochs.
+ *
+ * InputTask reads this snapshot to tag events with current epochs.
+ * Admission is closed by default until ElevatorTask publishes a new context.
  */
 typedef struct
 {
@@ -57,9 +74,11 @@ typedef struct
     bool     b_admission_open;
 } app_input_context_t;
 
-/** @brief Counts are relative to the calibrated floor-1 reference.
- * Nominal floor targets are 0, 4096 and 8192 counts. A sample without a valid
- * calibrated reference must set b_valid to false, including after lost turns.
+/** @brief Counts relative to the calibrated floor-1 reference.
+ *
+ * Nominal floor targets are 0, 4096 and 8192 counts. A sample without
+ * a valid calibrated reference must set b_valid to false, including
+ * after lost turns.
  */
 typedef struct
 {
@@ -119,9 +138,11 @@ typedef enum
     APP_DIRECTION_DOWN
 } app_direction_t;
 
-/** @brief ElevatorTask publishes snapshots; DisplayTask owns OLED and LEDs.
- * current_floor is 0 when unknown or between floors, otherwise 1..3.
- * b_ready includes IDLE, empty waiting queue, no target, no lock/emergency.
+/** @brief Display snapshot published by ElevatorTask.
+ *
+ * DisplayTask owns OLED and LEDs. current_floor is 0 when unknown or
+ * between floors, otherwise 1..3. b_ready includes IDLE, empty waiting
+ * queue, no target, no lock and no emergency.
  */
 typedef struct
 {
@@ -133,32 +154,41 @@ typedef struct
     bool            b_ready;
 } app_display_snapshot_t;
 
-/** @brief Create all queues once, before scheduler start, outside an ISR.
- * Returns pdPASS on success (including repeated startup calls), pdFAIL on
- * invalid context or allocation failure. No task, mutex or notification is
- * created here. Queue handles are published only after all allocations pass.
+/** @brief Create all queues once before scheduler start, outside an ISR.
+ *
+ * Returns pdPASS on success, including repeated startup calls, and pdFAIL
+ * on invalid context or allocation failure. No task, mutex or notification
+ * is created here. Queue handles are published only after all allocations
+ * pass. The current malloc-failed hook may halt before allocation failure
+ * returns.
  */
 BaseType_t app_ipc_init(void);
 
 /** @brief Return a queue handle, or NULL before init / for an invalid ID.
+ *
  * INPUT: app_input_event_t, InputTask -> ElevatorTask.
  * FLOOR: uint8_t (1..3), owned only by ElevatorTask.
  * MOTOR_COMMAND: app_motor_command_t, ElevatorTask -> MotorTask.
  * MOTOR_REPORT: app_motor_report_t, MotorTask -> ElevatorTask.
  * POSITION: app_position_t, MotorTask -> ElevatorTask, overwrite mailbox.
  * DISPLAY: app_display_snapshot_t, ElevatorTask -> DisplayTask, mailbox.
- * Only POSITION/DISPLAY use xQueueOverwrite.
+ *
+ * Only POSITION and DISPLAY use xQueueOverwrite. Consumers copy messages
+ * with receive operations. Do not delete these queues.
  */
 QueueHandle_t app_ipc_queue(app_queue_id_t queue_id);
 
 /** @brief Publish the latest input context from ElevatorTask.
+ *
  * The context is copied atomically. Call from task context only.
  */
 BaseType_t app_ipc_input_context_publish(
     const app_input_context_t *p_context);
 
 /** @brief Read a coherent copy of the latest input context.
- * Returns pdFAIL if IPC is not initialized or arguments/context are invalid.
+ *
+ * Returns pdFAIL if IPC is not initialized, arguments are invalid,
+ * or the scheduler is not running.
  */
 BaseType_t app_ipc_input_context_read(
     app_input_context_t *p_context);
@@ -166,3 +196,4 @@ BaseType_t app_ipc_input_context_read(
 #endif /* APP_IPC_H */
 
 /*** end of file ***/
+

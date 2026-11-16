@@ -1,9 +1,10 @@
+
 /** @file app_cfg.h
- * @brief Initial resource budget for the five application tasks.
+ * @brief Initial resource budget and configuration for application tasks.
  */
 #ifndef APP_CFG_H
 #define APP_CFG_H
-#define APP_INPUT_UID_CAPACITY (10u)
+
 /* Priorities exclude the kernel idle and software timer tasks. */
 #define APP_EMERGENCY_PRIORITY       (5u)
 #define APP_ELEVATOR_PRIORITY        (4u)
@@ -19,23 +20,29 @@
 #define APP_MOTOR_STACK_WORDS        (384u)
 #define APP_DISPLAY_STACK_WORDS      (256u)
 
-/* Sampling intervals in milliseconds; tasks convert using pdMS_TO_TICKS. */
+/* Sampling intervals in milliseconds; convert using pdMS_TO_TICKS. */
 #define APP_INPUT_PERIOD_MS          (10u)
 #define APP_RFID_PERIOD_MS           (50u)
-#define APP_RFID_RETRY_MS              (1000u)
+#define APP_RFID_RETRY_MS            (1000u)
 #define APP_POSITION_PERIOD_MS       (5u)
 #define APP_DISPLAY_PERIOD_MS        (200u)
-/* Input and RFID timing. */
-#define APP_INPUT_DEBOUNCE_SAMPLES  (3u)
-#define APP_AUTH_WINDOW_MS          (3000u)
-#define APP_RFID_NO_CARD_SAMPLES    (3u)
-/* The active destination is stored separately from the two waiting floors. */
+
+/* Authorization is measured from the AUTH event timestamp. */
+#define APP_AUTH_WINDOW_MS           (3000u)
+
+/* Input and RFID handling. */
+#define APP_INPUT_DEBOUNCE_SAMPLES   (3u)
+#define APP_RFID_NO_CARD_SAMPLES     (3u)
+#define APP_INPUT_UID_CAPACITY       (10u)
+
+/* Queue lengths shared by application tasks. */
 #define APP_INPUT_QUEUE_LENGTH       (6u)
 #define APP_FLOOR_QUEUE_LENGTH       (2u)
 #define APP_MOTOR_CMD_QUEUE_LENGTH   (1u)
 #define APP_MOTOR_RPT_QUEUE_LENGTH   (4u)
 #define APP_POSITION_QUEUE_LENGTH    (1u)
 #define APP_DISPLAY_QUEUE_LENGTH     (1u)
+
 /* Motor position and reference supervision. */
 #define APP_FLOOR_COUNT                  (3u)
 #define APP_POSITION_MAX_GAP_MS          \
@@ -57,8 +64,9 @@
  */
 #define APP_MOTOR_MECHANICS_CALIBRATED   (0u)
 #define APP_MOTOR_STEPS_PER_ENCODER_REV  (0u)
-#define APP_MOTOR_POSITIVE_DIR_CW         (2u)
-#define APP_MOTOR_MOVE_TIMEOUT_MS         (0u)
+#define APP_MOTOR_POSITIVE_DIR_CW        (2u)
+#define APP_MOTOR_MOVE_TIMEOUT_MS        (0u)
+
 #endif /* APP_CFG_H */
 
 /*** end of file ***/
